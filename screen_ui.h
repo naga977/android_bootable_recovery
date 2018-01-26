@@ -18,108 +18,179 @@
 #define RECOVERY_SCREEN_UI_H
 
 #include <pthread.h>
+#include <stdio.h>
+
+#include <string>
+#include <vector>
 
 #include "ui.h"
-#include "minui/minui.h"
+
+// From minui/minui.h.
+struct GRSurface;
 
 // Implementation of RecoveryUI appropriate for devices with a screen
 // (shows an icon + a progress bar, text logging, menu, etc.)
 class ScreenRecoveryUI : public RecoveryUI {
-  public:
-    ScreenRecoveryUI();
+ public:
+  ScreenRecoveryUI();
 
-    void Init();
-    void SetLocale(const char* locale);
+  bool Init(const std::string& locale) override;
 
-    // overall recovery state ("background image")
-    void SetBackground(Icon icon);
+  // overall recovery state ("background image")
+  void SetBackground(Icon icon) override;
+  void SetSystemUpdateText(bool security_update) override;
 
-    // progress indicator
-    void SetProgressType(ProgressType type);
-    void ShowProgress(float portion, float seconds);
-    void SetProgress(float fraction);
+  // progress indicator
+  void SetProgressType(ProgressType type) override;
+  void ShowProgress(float portion, float seconds) override;
+  void SetProgress(float fraction) override;
 
-    void SetStage(int current, int max);
+  void SetStage(int current, int max) override;
 
-    // text log
-    void ShowText(bool visible);
-    bool IsTextVisible();
-    bool WasTextEverVisible();
+  // text log
+  void ShowText(bool visible) override;
+  bool IsTextVisible() override;
+  bool WasTextEverVisible() override;
 
-    // printing messages
-    void Print(const char* fmt, ...); // __attribute__((format(printf, 1, 2)));
+  // printing messages
+  void Print(const char* fmt, ...) override __printflike(2, 3);
+  void PrintOnScreenOnly(const char* fmt, ...) override __printflike(2, 3);
+  void ShowFile(const char* filename) override;
 
-    // menu display
-    void StartMenu(const char* const * headers, const char* const * items,
-                           int initial_selection);
-    int SelectMenu(int sel);
-    void EndMenu();
+  // menu display
+  void StartMenu(const char* const* headers, const char* const* items,
+                 int initial_selection) override;
+  int SelectMenu(int sel) override;
+  void EndMenu() override;
 
-    void Redraw();
+  void KeyLongPress(int) override;
 
-    enum UIElement { HEADER, MENU, MENU_SEL_BG, MENU_SEL_FG, LOG, TEXT_FILL };
-    virtual void SetColor(UIElement e);
+  void Redraw();
 
-  private:
-    Icon currentIcon;
-    int installingFrame;
-    const char* locale;
-    bool rtl_locale;
+  enum UIElement {
+    HEADER,
+    MENU,
+    MENU_SEL_BG,
+    MENU_SEL_BG_ACTIVE,
+    MENU_SEL_FG,
+    LOG,
+    TEXT_FILL,
+    INFO
+  };
+  void SetColor(UIElement e) const;
 
-    pthread_mutex_t updateMutex;
-    gr_surface backgroundIcon[5];
-    gr_surface backgroundText[5];
-    gr_surface *installation;
-    gr_surface progressBarEmpty;
-    gr_surface progressBarFill;
-    gr_surface stageMarkerEmpty;
-    gr_surface stageMarkerFill;
+ protected:
+  // The margin that we don't want to use for showing texts (e.g. round screen, or screen with
+  // rounded corners).
+  const int kMarginWidth;
+  const int kMarginHeight;
 
-    ProgressType progressBarType;
+  // Number of frames per sec (default: 30) for both parts of the animation.
+  const int kAnimationFps;
 
-    float progressScopeStart, progressScopeSize, progress;
-    double progressScopeTime, progressScopeDuration;
+  // The scale factor from dp to pixels. 1.0 for mdpi, 4.0 for xxxhdpi.
+  const float density_;
 
-    // true when both graphics pages are the same (except for the
-    // progress bar)
-    bool pagesIdentical;
+  Icon currentIcon;
 
-    static const int kMaxCols = 96;
-    static const int kMaxRows = 96;
+  // The layout to use.
+  int layout_;
 
-    // Log text overlay, displayed when a magic key is pressed
-    char text[kMaxRows][kMaxCols];
-    int text_cols, text_rows;
-    int text_col, text_row, text_top;
-    bool show_text;
-    bool show_text_ever;   // has show_text ever been true?
+  GRSurface* error_icon;
 
-    char menu[kMaxRows][kMaxCols];
-    bool show_menu;
-    int menu_top, menu_items, menu_sel;
+  GRSurface* erasing_text;
+  GRSurface* error_text;
+  GRSurface* installing_text;
+  GRSurface* no_command_text;
 
-    pthread_t progress_t;
+  GRSurface** introFrames;
+  GRSurface** loopFrames;
 
-    int animation_fps;
-    int installing_frames;
-  protected:
-  private:
+  GRSurface* progressBarEmpty;
+  GRSurface* progressBarFill;
+  GRSurface* stageMarkerEmpty;
+  GRSurface* stageMarkerFill;
 
-    int iconX, iconY;
+  ProgressType progressBarType;
 
-    int stage, max_stage;
+  float progressScopeStart, progressScopeSize, progress;
+  double progressScopeTime, progressScopeDuration;
 
-    void draw_background_locked(Icon icon);
-    void draw_progress_locked();
-    void draw_screen_locked();
-    void update_screen_locked();
-    void update_progress_locked();
-    static void* progress_thread(void* cookie);
-    void progress_loop();
+  // true when both graphics pages are the same (except for the progress bar).
+  bool pagesIdentical;
 
-    void LoadBitmap(const char* filename, gr_surface* surface);
-    void LoadBitmapArray(const char* filename, int* frames, gr_surface** surface);
-    void LoadLocalizedBitmap(const char* filename, gr_surface* surface);
+  size_t text_cols_, text_rows_;
+
+  // Log text overlay, displayed when a magic key is pressed.
+  char** text_;
+  size_t text_col_, text_row_, text_top_;
+
+  bool show_text;
+  bool show_text_ever;  // has show_text ever been true?
+
+  std::vector<std::string> menu_;
+  const char* const* menu_headers_;
+  bool show_menu;
+  int menu_items, menu_sel;
+
+  // An alternate text screen, swapped with 'text_' when we're viewing a log file.
+  char** file_viewer_text_;
+
+  pthread_t progress_thread_;
+
+  // Number of intro frames and loop frames in the animation.
+  size_t intro_frames;
+  size_t loop_frames;
+
+  size_t current_frame;
+  bool intro_done;
+
+  int stage, max_stage;
+
+  int char_width_;
+  int char_height_;
+
+  pthread_mutex_t updateMutex;
+
+  virtual bool InitTextParams();
+
+  virtual void draw_background_locked();
+  virtual void draw_foreground_locked();
+  virtual void draw_screen_locked();
+  virtual void update_screen_locked();
+  virtual void update_progress_locked();
+
+  GRSurface* GetCurrentFrame() const;
+  GRSurface* GetCurrentText() const;
+
+  static void* ProgressThreadStartRoutine(void* data);
+  void ProgressThreadLoop();
+
+  virtual void ShowFile(FILE*);
+  virtual void PrintV(const char*, bool, va_list);
+  void PutChar(char);
+  void ClearText();
+
+  void LoadAnimation();
+  void LoadBitmap(const char* filename, GRSurface** surface);
+  void LoadLocalizedBitmap(const char* filename, GRSurface** surface);
+
+  int PixelsFromDp(int dp) const;
+  virtual int GetAnimationBaseline() const;
+  virtual int GetProgressBaseline() const;
+  virtual int GetTextBaseline() const;
+
+  // Draws a highlight bar at (x, y) - (x + width, y + height).
+  virtual void DrawHighlightBar(int x, int y, int width, int height) const;
+  // Draws a horizontal rule at Y. Returns the offset it should be moving along Y-axis.
+  virtual int DrawHorizontalRule(int y) const;
+  // Draws a line of text. Returns the offset it should be moving along Y-axis.
+  virtual int DrawTextLine(int x, int y, const char* line, bool bold) const;
+  // Draws multiple text lines. Returns the offset it should be moving along Y-axis.
+  int DrawTextLines(int x, int y, const char* const* lines) const;
+  // Similar to DrawTextLines() to draw multiple text lines, but additionally wraps long lines.
+  // Returns the offset it should be moving along Y-axis.
+  int DrawWrappedTextLines(int x, int y, const char* const* lines) const;
 };
 
 #endif  // RECOVERY_UI_H

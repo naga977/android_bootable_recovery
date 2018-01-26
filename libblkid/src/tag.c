@@ -66,9 +66,6 @@ blkid_tag blkid_find_tag_dev(blkid_dev dev, const char *type)
 {
 	struct list_head *p;
 
-	if (!dev || !type)
-		return NULL;
-
 	list_for_each(p, &dev->bid_tags) {
 		blkid_tag tmp = list_entry(p, struct blkid_struct_tag,
 					   bit_tags);
@@ -127,9 +124,6 @@ int blkid_set_tag(blkid_dev dev, const char *name,
 	char		*val = 0;
 	char		**dev_var = 0;
 
-	if (!dev || !name)
-		return -BLKID_ERR_PARAM;
-
 	if (value && !(val = strndup(value, vlength)))
 		return -BLKID_ERR_MEM;
 
@@ -161,7 +155,7 @@ int blkid_set_tag(blkid_dev dev, const char *name,
 		/* Existing tag not present, add to device */
 		if (!(t = blkid_new_tag()))
 			goto errout;
-		t->bit_name = name ? strdup(name) : NULL;
+		t->bit_name = strdup(name);
 		t->bit_val = val;
 		t->bit_dev = dev;
 
@@ -176,7 +170,7 @@ int blkid_set_tag(blkid_dev dev, const char *name,
 					goto errout;
 
 				DBG(TAG, ul_debug("    creating new cache tag head %s", name));
-				head->bit_name = name ? strdup(name) : NULL;
+				head->bit_name = strdup(name);
 				if (!head->bit_name)
 					goto errout;
 				list_add_tail(&head->bit_tags,

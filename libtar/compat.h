@@ -4,16 +4,13 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include <stdarg.h>
 #include <stddef.h>
 
 #ifdef HAVE_LIBGEN_H
 # include <libgen.h>
-#endif
-
-#ifdef HAVE_SELINUX
-#include "selinux/selinux.h"
 #endif
 
 

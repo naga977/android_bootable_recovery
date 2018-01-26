@@ -19,18 +19,13 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <string>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-static long tmplog_offset = 0;
-
-#define ui_print(...) printf(__VA_ARGS__)
-#define ui_print_overwrite(...) printf(__VA_ARGS__)
-
-// TODO: restore ui_print for LOGE
-#define LOGE(...) printf("E:" __VA_ARGS__)
+#define LOGE(...) fprintf(stdout, "E:" __VA_ARGS__)
 #define LOGW(...) fprintf(stdout, "W:" __VA_ARGS__)
 #define LOGI(...) fprintf(stdout, "I:" __VA_ARGS__)
 
@@ -45,15 +40,29 @@ static long tmplog_offset = 0;
 #define STRINGIFY(x) #x
 #define EXPAND(x) STRINGIFY(x)
 
+class RecoveryUI;
+
+extern RecoveryUI* ui;
+extern bool modified_flash;
 //typedef struct fstab_rec Volume;
+
+// The current stage, e.g. "1/2".
+extern std::string stage;
+
+// The reason argument provided in "--reason=".
+extern const char* reason;
 
 // fopen a file, mounting volumes and making parent dirs as necessary.
 FILE* fopen_path(const char *path, const char *mode);
 
-//void ui_print(const char* format, ...);
+void ui_print(const char* format, ...);
+
+static bool is_ro_debuggable();
 
 #ifdef __cplusplus
 }
 #endif
+
+bool reboot(const std::string& command);
 
 #endif  // RECOVERY_COMMON_H

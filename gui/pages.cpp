@@ -32,32 +32,49 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include "../twrp-functions.hpp"
+#include "../partitions.hpp"
 
 #include <string>
+#include <algorithm>
+
+#ifdef USE_MINZIP
+#include "../minzip/SysUtil.h"
+#else
+#include "../otautil/SysUtil.h"
+#endif
 
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
-#include "../minzip/SysUtil.h"
-#include "../minzip/Zip.h"
 #include "gui.h"
 }
+#include "../zipwrap.hpp"
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
 #include "blanktimer.hpp"
 
+// version 2 requires theme to handle power button as action togglebacklight
+#define TW_THEME_VERSION 3
+
+#define TW_THEME_VER_ERR -2
+
 extern int gGuiRunning;
 
 std::map<std::string, PageSet*> PageManager::mPageSets;
 PageSet* PageManager::mCurrentSet;
-PageSet* PageManager::mBaseSet = NULL;
 MouseCursor *PageManager::mMouseCursor = NULL;
 HardwareKeyboard *PageManager::mHardwareKeyboard = NULL;
+bool PageManager::mReloadTheme = false;
+std::string PageManager::mStartPage = "main";
+std::vector<language_struct> Language_List;
 
 int tw_x_offset = 0;
 int tw_y_offset = 0;
+int tw_w_offset = 0;
+int tw_h_offset = 0;
 
 // Helper routine to convert a string to a color declaration
 int ConvertStrToColor(std::string str, COLOR* color)
@@ -137,20 +154,20 @@ xml_node<>* FindNode(xml_node<>* parent, const char* nodename, int depth /* = 0 
 			style = style->next_sibling("style");
 		}
 	} else {
-		// Search for stylename in the parent node <object type="foo" stylename="foo2">
+		// Search for stylename in the parent node <object type="foo" style="foo2">
 		xml_attribute<>* attr = parent->first_attribute("style");
 		// If no style is found anywhere else and the node wasn't found in the object itself
 		// as a special case we will search for a style that uses the same style name as the
 		// object type, so <object type="button"> would search for a style named "button"
 		if (!attr)
 			attr = parent->first_attribute("type");
-		if (attr) {
-			xml_node<>* node = PageManager::FindStyle(attr->value());
-			if (node) {
-				xml_node<>* stylenode = FindNode(node, nodename, depth + 1);
-				if (stylenode)
-					return stylenode;
-			}
+		// if there's no attribute type, the object type must be the element name
+		std::string stylename = attr ? attr->value() : parent->name();
+		xml_node<>* node = PageManager::FindStyle(stylename);
+		if (node) {
+			xml_node<>* stylenode = FindNode(node, nodename, depth + 1);
+			if (stylenode)
+				return stylenode;
 		}
 	}
 	return NULL;
@@ -229,7 +246,7 @@ AnimationResource* LoadAttrAnimation(xml_node<>* element, const char* attrname)
 		return PageManager::GetResources()->FindAnimation(name);
 }
 
-bool LoadPlacement(xml_node<>* node, int* x, int* y, int* w /* = NULL */, int* h /* = NULL */, RenderObject::Placement* placement /* = NULL */)
+bool LoadPlacement(xml_node<>* node, int* x, int* y, int* w /* = NULL */, int* h /* = NULL */, Placement* placement /* = NULL */)
 {
 	if (!node)
 		return false;
@@ -247,7 +264,7 @@ bool LoadPlacement(xml_node<>* node, int* x, int* y, int* w /* = NULL */, int* h
 		*h = LoadAttrIntScaleY(node, "h");
 
 	if (placement && node->first_attribute("placement"))
-		*placement = (RenderObject::Placement) LoadAttrInt(node, "placement");
+		*placement = (Placement) LoadAttrInt(node, "placement");
 
 	return true;
 }
@@ -360,6 +377,14 @@ bool Page::ProcessNode(xml_node<>* page, std::vector<xml_node<>*> *templates, in
 			mRenders.push_back(element);
 			mActions.push_back(element);
 		}
+		else if (type == "terminal")
+		{
+			GUITerminal* element = new GUITerminal(child);
+			mObjects.push_back(element);
+			mRenders.push_back(element);
+			mActions.push_back(element);
+			mInputs.push_back(element);
+		}
 		else if (type == "button")
 		{
 			GUIButton* element = new GUIButton(child);
@@ -440,6 +465,13 @@ bool Page::ProcessNode(xml_node<>* page, std::vector<xml_node<>*> *templates, in
 		else if (type == "patternpassword")
 		{
 			GUIPatternPassword* element = new GUIPatternPassword(child);
+			mObjects.push_back(element);
+			mRenders.push_back(element);
+			mActions.push_back(element);
+		}
+		else if (type == "textbox")
+		{
+			GUITextBox* element = new GUITextBox(child);
 			mObjects.push_back(element);
 			mRenders.push_back(element);
 			mActions.push_back(element);
@@ -565,15 +597,13 @@ int Page::NotifyKey(int key, bool down)
 {
 	std::vector<ActionObject*>::reverse_iterator iter;
 
-	// Don't try to handle a lack of handlers
-	if (mActions.size() == 0)
-		return 1;
-
 	int ret = 1;
 	// We work backwards, from top-most element to bottom-most element
 	for (iter = mActions.rbegin(); iter != mActions.rend(); iter++)
 	{
 		ret = (*iter)->NotifyKey(key, down);
+		if (ret == 0)
+			return 0;
 		if (ret < 0) {
 			LOGERR("An action handler has returned an error\n");
 			ret = 1;
@@ -582,22 +612,18 @@ int Page::NotifyKey(int key, bool down)
 	return ret;
 }
 
-int Page::NotifyKeyboard(int key)
+int Page::NotifyCharInput(int ch)
 {
 	std::vector<InputObject*>::reverse_iterator iter;
-
-	// Don't try to handle a lack of handlers
-	if (mInputs.size() == 0)
-		return 1;
 
 	// We work backwards, from top-most element to bottom-most element
 	for (iter = mInputs.rbegin(); iter != mInputs.rend(); iter++)
 	{
-		int ret = (*iter)->NotifyKeyboard(key);
+		int ret = (*iter)->NotifyCharInput(ch);
 		if (ret == 0)
 			return 0;
 		else if (ret < 0)
-			LOGERR("A keyboard handler has returned an error");
+			LOGERR("A char input handler has returned an error\n");
 	}
 	return 1;
 }
@@ -606,10 +632,6 @@ int Page::SetKeyBoardFocus(int inFocus)
 {
 	std::vector<InputObject*>::reverse_iterator iter;
 
-	// Don't try to handle a lack of handlers
-	if (mInputs.size() == 0)
-		return 1;
-
 	// We work backwards, from top-most element to bottom-most element
 	for (iter = mInputs.rbegin(); iter != mInputs.rend(); iter++)
 	{
@@ -617,7 +639,7 @@ int Page::SetKeyBoardFocus(int inFocus)
 		if (ret == 0)
 			return 0;
 		else if (ret < 0)
-			LOGERR("An input focus handler has returned an error");
+			LOGERR("An input focus handler has returned an error\n");
 	}
 	return 1;
 }
@@ -643,16 +665,42 @@ int Page::NotifyVarChange(std::string varName, std::string value)
 	return 0;
 }
 
-PageSet::PageSet(char* xmlFile)
+
+// transient data for loading themes
+struct LoadingContext
+{
+	ZipWrap* zip; // zip to load theme from, or NULL for the stock theme
+	std::set<std::string> filenames; // to detect cyclic includes
+	std::string basepath; // if zip is NULL, base path to load includes from with trailing slash, otherwise empty
+	std::vector<xml_document<>*> xmldocs; // all loaded xml docs
+	std::vector<char*> xmlbuffers; // text buffers with xml content
+	std::vector<xml_node<>*> styles; // refer to <styles> nodes inside xmldocs
+	std::vector<xml_node<>*> templates; // refer to <templates> nodes inside xmldocs
+
+	LoadingContext()
+	{
+		zip = NULL;
+	}
+
+	~LoadingContext()
+	{
+		// free all xml buffers
+		for (std::vector<char*>::iterator it = xmlbuffers.begin(); it != xmlbuffers.end(); ++it)
+			free(*it);
+	}
+
+};
+
+// for FindStyle
+LoadingContext* PageManager::currentLoadingContext = NULL;
+
+
+PageSet::PageSet()
 {
 	mResources = new ResourceManager;
 	mCurrentPage = NULL;
 
-	mXmlFile = xmlFile;
-	if (xmlFile)
-		mDoc.parse<0>(mXmlFile);
-	else
-		mCurrentPage = new Page(NULL, NULL);
+	set_scale_values(1, 1); // Reset any previous scaling values
 }
 
 PageSet::~PageSet()
@@ -662,35 +710,173 @@ PageSet::~PageSet()
 		delete *itr;
 
 	delete mResources;
-	free(mXmlFile);
+}
 
-	mDoc.clear();
+int PageSet::Load(LoadingContext& ctx, const std::string& filename)
+{
+	bool isMain = ctx.xmlbuffers.empty(); // if we have no files yet, remember that this is the main XML file
 
-	for (std::vector<xml_document<>*>::iterator itr = mIncludedDocs.begin(); itr != mIncludedDocs.end(); ++itr) {
-		(*itr)->clear();
-		delete *itr;
+	if (!ctx.filenames.insert(filename).second)
+		// ignore already loaded files to prevent crash with cyclic includes
+		return 0;
+
+	// load XML into buffer
+	char* xmlbuffer = PageManager::LoadFileToBuffer(filename, ctx.zip);
+	if (!xmlbuffer)
+		return -1; // error already displayed by LoadFileToBuffer
+	ctx.xmlbuffers.push_back(xmlbuffer);
+
+	// parse XML
+	xml_document<>* doc = new xml_document<>();
+	doc->parse<0>(xmlbuffer);
+	ctx.xmldocs.push_back(doc);
+
+	xml_node<>* root = doc->first_node("recovery");
+	if (!root)
+		root = doc->first_node("install");
+	if (!root) {
+		LOGERR("Unknown root element in %s\n", filename.c_str());
+		return -1;
+	}
+
+	if (isMain) {
+		int rc = LoadDetails(ctx, root);
+		if (rc != 0)
+			return rc;
+	}
+
+	LOGINFO("Loading resources...\n");
+	xml_node<>* child = root->first_node("resources");
+	if (child)
+		mResources->LoadResources(child, ctx.zip, "theme");
+
+	LOGINFO("Loading variables...\n");
+	child = root->first_node("variables");
+	if (child)
+		LoadVariables(child);
+
+	LOGINFO("Loading mouse cursor...\n");
+	child = root->first_node("mousecursor");
+	if (child)
+		PageManager::LoadCursorData(child);
+
+	LOGINFO("Loading pages...\n");
+	child = root->first_node("templates");
+	if (child)
+		ctx.templates.push_back(child);
+
+	child = root->first_node("styles");
+	if (child)
+		ctx.styles.push_back(child);
+
+	// Load pages
+	child = root->first_node("pages");
+	if (child) {
+		if (LoadPages(ctx, child)) {
+			LOGERR("PageSet::Load returning -1\n");
+			return -1;
+		}
+	}
+
+	// process includes recursively
+	child = root->first_node("include");
+	if (child) {
+		xml_node<>* include = child->first_node("xmlfile");
+		while (include != NULL) {
+			xml_attribute<>* attr = include->first_attribute("name");
+			if (!attr) {
+				LOGERR("Skipping include/xmlfile with no name\n");
+				continue;
+			}
+
+			string filename = ctx.basepath + attr->value();
+			LOGINFO("Including file: %s...\n", filename.c_str());
+			int rc = Load(ctx, filename);
+			if (rc != 0)
+				return rc;
+
+			include = include->next_sibling("xmlfile");
+		}
+	}
+
+	return 0;
+}
+
+void PageSet::MakeEmergencyConsoleIfNeeded()
+{
+	if (mPages.empty()) {
+		mCurrentPage = new Page(NULL, NULL); // fallback console page
+		// TODO: since removal of non-TTF fonts, the emergency console doesn't work without a font, which might be missing too
+		mPages.push_back(mCurrentPage);
 	}
 }
 
-int PageSet::Load(ZipArchive* package)
+int PageSet::LoadLanguage(char* languageFile, ZipWrap* package)
 {
+	xml_document<> lang;
 	xml_node<>* parent;
 	xml_node<>* child;
-	xml_node<>* xmltemplate;
-	xml_node<>* xmlstyle;
+	std::string resource_source;
+	int ret = 0;
 
-	parent = mDoc.first_node("recovery");
-	if (!parent)
-		parent = mDoc.first_node("install");
+	if (languageFile) {
+		printf("parsing languageFile\n");
+		lang.parse<0>(languageFile);
+		printf("parsing languageFile done\n");
+	} else {
+		return -1;
+	}
 
-	set_scale_values(1, 1); // Reset any previous scaling values
+	parent = lang.first_node("language");
+	if (!parent) {
+		LOGERR("Unable to locate language node in language file.\n");
+		lang.clear();
+		return -1;
+	}
 
-	// Now, let's parse the XML
-	LOGINFO("Checking resolution...\n");
-	child = parent->first_node("details");
+	child = parent->first_node("display");
 	if (child) {
+		DataManager::SetValue("tw_language_display", child->value());
+		resource_source = child->value();
+	} else {
+		LOGERR("language file does not have a display value set\n");
+		DataManager::SetValue("tw_language_display", "Not Set");
+		resource_source = languageFile;
+	}
+
+	child = parent->first_node("resources");
+	if (child)
+		mResources->LoadResources(child, package, resource_source);
+	else
+		ret = -1;
+	DataManager::SetValue("tw_backup_name", gui_lookup("auto_generate", "(Auto Generate)"));
+	lang.clear();
+	return ret;
+}
+
+int PageSet::LoadDetails(LoadingContext& ctx, xml_node<>* root)
+{
+	xml_node<>* child = root->first_node("details");
+	if (child) {
+		int theme_ver = 0;
+		xml_node<>* themeversion = child->first_node("themeversion");
+		if (themeversion && themeversion->value()) {
+			theme_ver = atoi(themeversion->value());
+		} else {
+			LOGINFO("No themeversion in theme.\n");
+		}
+		if (theme_ver != TW_THEME_VERSION) {
+			LOGINFO("theme version from xml: %i, expected %i\n", theme_ver, TW_THEME_VERSION);
+			if (ctx.zip) {
+				gui_err("theme_ver_err=Custom theme version does not match TWRP version. Using stock theme.");
+				return TW_THEME_VER_ERR;
+			} else {
+				gui_print_color("warning", "Stock theme version does not match TWRP version.\n");
+			}
+		}
 		xml_node<>* resolution = child->first_node("resolution");
 		if (resolution) {
+			LOGINFO("Checking resolution...\n");
 			xml_attribute<>* width_attr = resolution->first_attribute("width");
 			xml_attribute<>* height_attr = resolution->first_attribute("height");
 			xml_attribute<>* noscale_attr = resolution->first_attribute("noscaling");
@@ -713,16 +899,17 @@ int PageSet::Load(ZipArchive* package)
 				}
 #endif
 				if (width != 0 && height != 0) {
-					float scale_w = ((float)gr_fb_width() - ((float)offx * 2.0)) / (float)width;
-					float scale_h = ((float)gr_fb_height() - ((float)offy * 2.0)) / (float)height;
+					float scale_w = (((float)gr_fb_width() + (float)tw_w_offset) - ((float)offx * 2.0)) / (float)width;
+					float scale_h = (((float)gr_fb_height() + (float)tw_h_offset) - ((float)offy * 2.0)) / (float)height;
 #ifdef TW_ROUND_SCREEN
-					float scale_off_w = (float)gr_fb_width() / (float)width;
-					float scale_off_h = (float)gr_fb_height() / (float)height;
+					float scale_off_w = ((float)gr_fb_width() + (float)tw_w_offset) / (float)width;
+					float scale_off_h = ((float)gr_fb_height() + (float)tw_h_offset) / (float)height;
 					tw_x_offset = offx * scale_off_w;
 					tw_y_offset = offy * scale_off_h;
 #endif
 					if (scale_w != 1 || scale_h != 1) {
-						LOGINFO("Scaling theme width %fx and height %fx, offsets x: %i y: %i\n", scale_w, scale_h, tw_x_offset, tw_y_offset);
+						LOGINFO("Scaling theme width %fx and height %fx, offsets x: %i y: %i w: %i h: %i\n",
+							scale_w, scale_h, tw_x_offset, tw_y_offset, tw_w_offset, tw_h_offset);
 						set_scale_values(scale_w, scale_h);
 					}
 				}
@@ -734,170 +921,6 @@ int PageSet::Load(ZipArchive* package)
 		}
 	} else {
 		LOGINFO("XML contains no details tag, no scaling will be applied.\n");
-	}
-	LOGINFO("Loading resources...\n");
-	child = parent->first_node("resources");
-	if (child)
-		mResources->LoadResources(child, package);
-
-	LOGINFO("Loading variables...\n");
-	child = parent->first_node("variables");
-	if (child)
-		LoadVariables(child);
-
-	LOGINFO("Loading mouse cursor...\n");
-	child = parent->first_node("mousecursor");
-	if(child)
-		PageManager::LoadCursorData(child);
-
-	LOGINFO("Loading pages...\n");
-	// This may be NULL if no templates are present
-	xmltemplate = parent->first_node("templates");
-	if (xmltemplate)
-		templates.push_back(xmltemplate);
-
-	// Load styles if present
-	xmlstyle = parent->first_node("styles");
-	if (xmlstyle)
-		styles.push_back(xmlstyle);
-
-	child = parent->first_node("pages");
-	if (child) {
-		if (LoadPages(child)) {
-			LOGERR("PageSet::Load returning -1\n");
-			return -1;
-		}
-	}
-
-	return CheckInclude(package, &mDoc);
-}
-
-int PageSet::CheckInclude(ZipArchive* package, xml_document<> *parentDoc)
-{
-	xml_node<>* par;
-	xml_node<>* par2;
-	xml_node<>* chld;
-	xml_node<>* parent;
-	xml_node<>* child;
-	xml_node<>* xmltemplate;
-	xml_node<>* xmlstyle;
-	long len;
-	char* xmlFile = NULL;
-	string filename;
-	xml_document<> *doc = NULL;
-
-	par = parentDoc->first_node("recovery");
-	if (!par) {
-		par = parentDoc->first_node("install");
-	}
-	if (!par) {
-		return 0;
-	}
-
-	par2 = par->first_node("include");
-	if (!par2)
-		return 0;
-	chld = par2->first_node("xmlfile");
-	while (chld != NULL) {
-		xml_attribute<>* attr = chld->first_attribute("name");
-		if (!attr)
-			break;
-
-		if (!package) {
-			// We can try to load the XML directly...
-			filename = TWRES;
-			filename += attr->value();
-			LOGINFO("PageSet::CheckInclude loading filename: '%s'\n", filename.c_str());
-			struct stat st;
-			if(stat(filename.c_str(),&st) != 0) {
-				LOGERR("Unable to locate '%s'\n", filename.c_str());
-				return -1;
-			}
-
-			len = st.st_size;
-			xmlFile = (char*) malloc(len + 1);
-			if (!xmlFile)
-				return -1;
-
-			int fd = open(filename.c_str(), O_RDONLY);
-			if (fd == -1)
-				return -1;
-
-			read(fd, xmlFile, len);
-			close(fd);
-		} else {
-			filename += attr->value();
-			LOGINFO("PageSet::CheckInclude loading filename: '%s'\n", filename.c_str());
-			const ZipEntry* ui_xml = mzFindZipEntry(package, filename.c_str());
-			if (ui_xml == NULL)
-			{
-				LOGERR("Unable to locate '%s' in zip file\n", filename.c_str());
-				return -1;
-			}
-
-			// Allocate the buffer for the file
-			len = mzGetZipEntryUncompLen(ui_xml);
-			xmlFile = (char*) malloc(len + 1);
-			if (!xmlFile)
-				return -1;
-
-			if (!mzExtractZipEntryToBuffer(package, ui_xml, (unsigned char*) xmlFile))
-			{
-				LOGERR("Unable to extract '%s'\n", filename.c_str());
-				return -1;
-			}
-		}
-
-		xmlFile[len] = '\0';
-		doc = new xml_document<>();
-		doc->parse<0>(xmlFile);
-
-		parent = doc->first_node("recovery");
-		if (!parent)
-			parent = doc->first_node("install");
-
-		// Now, let's parse the XML
-		LOGINFO("Loading included resources...\n");
-		child = parent->first_node("resources");
-		if (child)
-			mResources->LoadResources(child, package);
-
-		LOGINFO("Loading included variables...\n");
-		child = parent->first_node("variables");
-		if (child)
-			LoadVariables(child);
-
-		LOGINFO("Loading mouse cursor...\n");
-		child = parent->first_node("mousecursor");
-		if(child)
-			PageManager::LoadCursorData(child);
-
-		LOGINFO("Loading included pages...\n");
-		// This may be NULL if no templates are present
-		xmltemplate = parent->first_node("templates");
-		if (xmltemplate)
-			templates.push_back(xmltemplate);
-
-		// Load styles if present
-		xmlstyle = parent->first_node("styles");
-		if (xmlstyle)
-			styles.push_back(xmlstyle);
-
-		child = parent->first_node("pages");
-		if (child && LoadPages(child))
-		{
-			templates.pop_back();
-			doc->clear();
-			delete doc;
-			return -1;
-		}
-
-		mIncludedDocs.push_back(doc);
-
-		if (CheckInclude(package, doc))
-			return -1;
-
-		chld = chld->next_sibling("xmlfile");
 	}
 
 	return 0;
@@ -988,7 +1011,7 @@ int PageSet::LoadVariables(xml_node<>* vars)
 		name = child->first_attribute("name");
 		value = child->first_attribute("value");
 		persist = child->first_attribute("persist");
-		if(name && value)
+		if (name && value)
 		{
 			if (strcmp(name->value(), "tw_x_offset") == 0) {
 				tw_x_offset = atoi(value->value());
@@ -997,6 +1020,16 @@ int PageSet::LoadVariables(xml_node<>* vars)
 			}
 			if (strcmp(name->value(), "tw_y_offset") == 0) {
 				tw_y_offset = atoi(value->value());
+				child = child->next_sibling("variable");
+				continue;
+			}
+			if (strcmp(name->value(), "tw_w_offset") == 0) {
+				tw_w_offset = atoi(value->value());
+				child = child->next_sibling("variable");
+				continue;
+			}
+			if (strcmp(name->value(), "tw_h_offset") == 0) {
+				tw_h_offset = atoi(value->value());
 				child = child->next_sibling("variable");
 				continue;
 			}
@@ -1034,7 +1067,7 @@ int PageSet::LoadVariables(xml_node<>* vars)
 	return 0;
 }
 
-int PageSet::LoadPages(xml_node<>* pages)
+int PageSet::LoadPages(LoadingContext& ctx, xml_node<>* pages)
 {
 	xml_node<>* child;
 
@@ -1044,7 +1077,7 @@ int PageSet::LoadPages(xml_node<>* pages)
 	child = pages->first_node("page");
 	while (child != NULL)
 	{
-		Page* page = new Page(child, &templates);
+		Page* page = new Page(child, &ctx.templates);
 		if (page->GetName().empty())
 		{
 			LOGERR("Unable to process load page\n");
@@ -1064,6 +1097,11 @@ int PageSet::LoadPages(xml_node<>* pages)
 int PageSet::IsCurrentPage(Page* page)
 {
 	return ((mCurrentPage && mCurrentPage == page) ? 1 : 0);
+}
+
+std::string PageSet::GetCurrentPage() const
+{
+	return mCurrentPage ? mCurrentPage->GetName() : "";
 }
 
 int PageSet::Render(void)
@@ -1118,12 +1156,12 @@ int PageSet::NotifyKey(int key, bool down)
 	return (mCurrentPage ? mCurrentPage->NotifyKey(key, down) : -1);
 }
 
-int PageSet::NotifyKeyboard(int key)
+int PageSet::NotifyCharInput(int ch)
 {
 	if (!mOverlays.empty())
-		return mOverlays.back()->NotifyKeyboard(key);
+		return mOverlays.back()->NotifyCharInput(ch);
 
-	return (mCurrentPage ? mCurrentPage->NotifyKeyboard(key) : -1);
+	return (mCurrentPage ? mCurrentPage->NotifyCharInput(ch) : -1);
 }
 
 int PageSet::SetKeyBoardFocus(int inFocus)
@@ -1144,15 +1182,169 @@ int PageSet::NotifyVarChange(std::string varName, std::string value)
 	return (mCurrentPage ? mCurrentPage->NotifyVarChange(varName, value) : -1);
 }
 
+void PageSet::AddStringResource(std::string resource_source, std::string resource_name, std::string value)
+{
+	mResources->AddStringResource(resource_source, resource_name, value);
+}
+
+char* PageManager::LoadFileToBuffer(std::string filename, ZipWrap* package) {
+	size_t len;
+	char* buffer = NULL;
+
+	if (!package) {
+		// We can try to load the XML directly...
+		LOGINFO("PageManager::LoadFileToBuffer loading filename: '%s' directly\n", filename.c_str());
+		struct stat st;
+		if (stat(filename.c_str(),&st) != 0) {
+			// This isn't always an error, sometimes we request files that don't exist.
+			return NULL;
+		}
+
+		len = (size_t)st.st_size;
+
+		buffer = (char*) malloc(len + 1);
+		if (!buffer) {
+			LOGERR("PageManager::LoadFileToBuffer failed to malloc\n");
+			return NULL;
+		}
+
+		int fd = open(filename.c_str(), O_RDONLY);
+		if (fd == -1) {
+			LOGERR("PageManager::LoadFileToBuffer failed to open '%s' - (%s)\n", filename.c_str(), strerror(errno));
+			free(buffer);
+			return NULL;
+		}
+
+		if (read(fd, buffer, len) < 0) {
+			LOGERR("PageManager::LoadFileToBuffer failed to read '%s' - (%s)\n", filename.c_str(), strerror(errno));
+			free(buffer);
+			close(fd);
+			return NULL;
+		}
+		close(fd);
+	} else {
+		LOGINFO("PageManager::LoadFileToBuffer loading filename: '%s' from zip\n", filename.c_str());
+		if (!package->EntryExists(filename)) {
+			LOGERR("Unable to locate '%s' in zip file\n", filename.c_str());
+			return NULL;
+		}
+
+		// Allocate the buffer for the file
+		len = package->GetUncompressedSize(filename);
+		buffer = (char*) malloc(len + 1);
+		if (!buffer)
+			return NULL;
+
+		if (!package->ExtractToBuffer(filename, (unsigned char*) buffer)) {
+			LOGERR("Unable to extract '%s'\n", filename.c_str());
+			free(buffer);
+			return NULL;
+		}
+	}
+	// NULL-terminate the string
+	buffer[len] = 0x00;
+	return buffer;
+}
+
+void PageManager::LoadLanguageListDir(string dir) {
+	if (!TWFunc::Path_Exists(dir)) {
+		LOGERR("LoadLanguageListDir '%s' path not found\n", dir.c_str());
+		return;
+	}
+
+	DIR *d = opendir(dir.c_str());
+	struct dirent *p;
+
+	if (d == NULL) {
+		LOGERR("LoadLanguageListDir error opening dir: '%s', %s\n", dir.c_str(), strerror(errno));
+		return;
+	}
+
+	while ((p = readdir(d))) {
+		if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..") || strlen(p->d_name) < 5)
+			continue;
+
+		string file = p->d_name;
+		if (file.substr(strlen(p->d_name) - 4) != ".xml")
+			continue;
+		string path = dir + p->d_name;
+		string file_no_extn = file.substr(0, strlen(p->d_name) - 4);
+		struct language_struct language_entry;
+		language_entry.filename = file_no_extn;
+		char* xmlFile = PageManager::LoadFileToBuffer(dir + p->d_name, NULL);
+		if (xmlFile == NULL) {
+			LOGERR("LoadLanguageListDir unable to load '%s'\n", language_entry.filename.c_str());
+			continue;
+		}
+		xml_document<> *doc = new xml_document<>();
+		doc->parse<0>(xmlFile);
+
+		xml_node<>* parent = doc->first_node("language");
+		if (!parent) {
+			LOGERR("Invalid language XML file '%s'\n", language_entry.filename.c_str());
+		} else {
+			xml_node<>* child = parent->first_node("display");
+			if (child) {
+				language_entry.displayvalue = child->value();
+			} else {
+				LOGERR("No display value for '%s'\n", language_entry.filename.c_str());
+				language_entry.displayvalue = language_entry.filename;
+			}
+			Language_List.push_back(language_entry);
+		}
+		doc->clear();
+		delete doc;
+		free(xmlFile);
+	}
+	closedir(d);
+}
+
+void PageManager::LoadLanguageList(ZipWrap* package) {
+	Language_List.clear();
+	if (TWFunc::Path_Exists(TWRES "customlanguages"))
+		TWFunc::removeDir(TWRES "customlanguages", true);
+	if (package) {
+		TWFunc::Recursive_Mkdir(TWRES "customlanguages");
+		package->ExtractRecursive("languages", TWRES "customlanguages/");
+		LoadLanguageListDir(TWRES "customlanguages/");
+	} else {
+		LoadLanguageListDir(TWRES "languages/");
+	}
+
+	std::sort(Language_List.begin(), Language_List.end());
+}
+
+void PageManager::LoadLanguage(string filename) {
+	string actual_filename;
+	if (TWFunc::Path_Exists(TWRES "customlanguages/" + filename + ".xml"))
+		actual_filename = TWRES "customlanguages/" + filename + ".xml";
+	else
+		actual_filename = TWRES "languages/" + filename + ".xml";
+	char* xmlFile = PageManager::LoadFileToBuffer(actual_filename, NULL);
+	if (xmlFile == NULL)
+		LOGERR("Unable to load '%s'\n", actual_filename.c_str());
+	else {
+		mCurrentSet->LoadLanguage(xmlFile, NULL);
+		free(xmlFile);
+	}
+	PartitionManager.Translate_Partition_Display_Names();
+}
+
 int PageManager::LoadPackage(std::string name, std::string package, std::string startpage)
 {
-	int fd;
-	ZipArchive zip, *pZip = NULL;
-	long len;
-	char* xmlFile = NULL;
+	std::string mainxmlfilename = package;
+	ZipWrap zip;
+	char* languageFile = NULL;
+	char* baseLanguageFile = NULL;
 	PageSet* pageSet = NULL;
 	int ret;
 	MemMapping map;
+
+	mReloadTheme = false;
+	mStartPage = startpage;
+
+	// init the loading context
+	LoadingContext ctx;
 
 	// Open the XML file
 	LOGINFO("Loading package: %s (%s)\n", name.c_str(), package.c_str());
@@ -1161,98 +1353,91 @@ int PageManager::LoadPackage(std::string name, std::string package, std::string 
 		LOGINFO("Load XML directly\n");
 		tw_x_offset = TW_X_OFFSET;
 		tw_y_offset = TW_Y_OFFSET;
-		// We can try to load the XML directly...
-		struct stat st;
-		if(stat(package.c_str(),&st) != 0)
-			return -1;
-
-		len = st.st_size;
-		xmlFile = (char*) malloc(len + 1);
-		if (!xmlFile)
-			return -1;
-
-		fd = open(package.c_str(), O_RDONLY);
-		if (fd == -1)
-			goto error;
-
-		read(fd, xmlFile, len);
-		close(fd);
+		tw_w_offset = TW_W_OFFSET;
+		tw_h_offset = TW_H_OFFSET;
+		if (name != "splash") {
+			LoadLanguageList(NULL);
+			languageFile = LoadFileToBuffer(TWRES "languages/en.xml", NULL);
+		}
+		ctx.basepath = TWRES;
 	}
 	else
 	{
 		LOGINFO("Loading zip theme\n");
 		tw_x_offset = 0;
 		tw_y_offset = 0;
+		tw_w_offset = 0;
+		tw_h_offset = 0;
 		if (!TWFunc::Path_Exists(package))
 			return -1;
+#ifdef USE_MINZIP
 		if (sysMapFile(package.c_str(), &map) != 0) {
+#else
+		if (!map.MapFile(package)) {
+#endif
 			LOGERR("Failed to map '%s'\n", package.c_str());
-			return -1;
+			goto error;
 		}
-		if (mzOpenZipArchive(map.addr, map.length, &zip)) {
+		if (!zip.Open(package.c_str(), &map)) {
 			LOGERR("Unable to open zip archive '%s'\n", package.c_str());
+#ifdef USE_MINZIP
 			sysReleaseMap(&map);
-			return -1;
-		}
-		pZip = &zip;
-		const ZipEntry* ui_xml = mzFindZipEntry(&zip, "ui.xml");
-		if (ui_xml == NULL)
-		{
-			LOGERR("Unable to locate ui.xml in zip file\n");
+#endif
 			goto error;
 		}
-
-		// Allocate the buffer for the file
-		len = mzGetZipEntryUncompLen(ui_xml);
-		xmlFile = (char*) malloc(len + 1);
-		if (!xmlFile)
-			goto error;
-
-		if (!mzExtractZipEntryToBuffer(&zip, ui_xml, (unsigned char*) xmlFile))
-		{
-			LOGERR("Unable to extract ui.xml\n");
-			goto error;
-		}
+		ctx.zip = &zip;
+		mainxmlfilename = "ui.xml";
+		LoadLanguageList(ctx.zip);
+		languageFile = LoadFileToBuffer("languages/en.xml", ctx.zip);
+		baseLanguageFile = LoadFileToBuffer(TWRES "languages/en.xml", NULL);
 	}
-
-	// NULL-terminate the string
-	xmlFile[len] = 0x00;
 
 	// Before loading, mCurrentSet must be the loading package so we can find resources
 	pageSet = mCurrentSet;
-	mCurrentSet = new PageSet(xmlFile);
+	mCurrentSet = new PageSet();
 
-	ret = mCurrentSet->Load(pZip);
-	if (ret == 0)
-	{
+	if (baseLanguageFile) {
+		mCurrentSet->LoadLanguage(baseLanguageFile, NULL);
+		free(baseLanguageFile);
+	}
+
+	if (languageFile) {
+		mCurrentSet->LoadLanguage(languageFile, ctx.zip);
+		free(languageFile);
+	}
+
+	// Load and parse the XML and all includes
+	currentLoadingContext = &ctx; // required to find styles
+	ret = mCurrentSet->Load(ctx, mainxmlfilename);
+	currentLoadingContext = NULL;
+
+	if (ret == 0) {
 		mCurrentSet->SetPage(startpage);
 		mPageSets.insert(std::pair<std::string, PageSet*>(name, mCurrentSet));
-	}
-	else
-	{
-		LOGERR("Package %s failed to load.\n", name.c_str());
+	} else {
+		if (ret != TW_THEME_VER_ERR)
+			LOGERR("Package %s failed to load.\n", name.c_str());
 	}
 
-	// The first successful package we loaded is the base
-	if (mBaseSet == NULL)
-		mBaseSet = mCurrentSet;
-
+	// reset to previous pageset
 	mCurrentSet = pageSet;
 
-	if (pZip) {
-		mzCloseZipArchive(pZip);
+	if (ctx.zip) {
+		ctx.zip->Close();
+#ifdef USE_MINZIP
 		sysReleaseMap(&map);
+#endif
 	}
 	return ret;
 
 error:
-	LOGERR("An internal error has occurred.\n");
-	if (pZip) {
-		mzCloseZipArchive(pZip);
+	// Sometimes we get here without a real error
+	if (ctx.zip) {
+		ctx.zip->Close();
+#ifdef USE_MINZIP
 		sysReleaseMap(&map);
+#endif
 	}
-	if (xmlFile)
-		free(xmlFile);
 	return -1;
 }
 
@@ -1277,6 +1462,7 @@ PageSet* PageManager::SelectPackage(std::string name)
 	if (tmp)
 	{
 		mCurrentSet = tmp;
+		mCurrentSet->MakeEmergencyConsoleIfNeeded();
 		mCurrentSet->NotifyVarChange("", "");
 	}
 	else
@@ -1289,27 +1475,28 @@ int PageManager::ReloadPackage(std::string name, std::string package)
 {
 	std::map<std::string, PageSet*>::iterator iter;
 
+	mReloadTheme = false;
+
 	iter = mPageSets.find(name);
 	if (iter == mPageSets.end())
 		return -1;
 
-	if(mMouseCursor)
+	if (mMouseCursor)
 		mMouseCursor->ResetData(gr_fb_width(), gr_fb_height());
 
 	PageSet* set = (*iter).second;
 	mPageSets.erase(iter);
 
-	if (LoadPackage(name, package, "main") != 0)
+	if (LoadPackage(name, package, mStartPage) != 0)
 	{
-		LOGERR("Failed to load package '%s'.\n", package.c_str());
+		LOGINFO("Failed to load package '%s'.\n", package.c_str());
 		mPageSets.insert(std::pair<std::string, PageSet*>(name, set));
 		return -1;
 	}
 	if (mCurrentSet == set)
 		SelectPackage(name);
-	if (mBaseSet == set)
-		mBaseSet = mCurrentSet;
 	delete set;
+	GUIConsole::Translate_Now();
 	return 0;
 }
 
@@ -1324,7 +1511,55 @@ void PageManager::ReleasePackage(std::string name)
 	PageSet* set = (*iter).second;
 	mPageSets.erase(iter);
 	delete set;
+	if (set == mCurrentSet)
+		mCurrentSet = NULL;
 	return;
+}
+
+int PageManager::RunReload() {
+	int ret_val = 0;
+	std::string theme_path;
+
+	if (!mReloadTheme)
+		return 0;
+
+	mReloadTheme = false;
+	theme_path = DataManager::GetSettingsStoragePath();
+	if (PartitionManager.Mount_By_Path(theme_path.c_str(), 1) < 0) {
+		LOGERR("Unable to mount %s during gui_reload_theme function.\n", theme_path.c_str());
+		ret_val = 1;
+	}
+
+	theme_path += "/TWRP/theme/ui.zip";
+	if (ret_val != 0 || ReloadPackage("TWRP", theme_path) != 0)
+	{
+		// Loading the custom theme failed - try loading the stock theme
+		LOGINFO("Attempting to reload stock theme...\n");
+		if (ReloadPackage("TWRP", TWRES "ui.xml"))
+		{
+			LOGERR("Failed to load base packages.\n");
+			ret_val = 1;
+		}
+	}
+	if (ret_val == 0) {
+		if (DataManager::GetStrValue("tw_language") != "en.xml") {
+			LOGINFO("Loading language '%s'\n", DataManager::GetStrValue("tw_language").c_str());
+			LoadLanguage(DataManager::GetStrValue("tw_language"));
+		}
+	}
+
+	// This makes the console re-translate
+	GUIConsole::Clear_For_Retranslation();
+
+	return ret_val;
+}
+
+void PageManager::RequestReload() {
+	mReloadTheme = true;
+}
+
+void PageManager::SetStartPage(const std::string& page_name) {
+	mStartPage = page_name;
 }
 
 int PageManager::ChangePage(std::string name)
@@ -1334,13 +1569,18 @@ int PageManager::ChangePage(std::string name)
 	return ret;
 }
 
+std::string PageManager::GetCurrentPage()
+{
+	return mCurrentSet ? mCurrentSet->GetCurrentPage() : "";
+}
+
 int PageManager::ChangeOverlay(std::string name)
 {
 	if (name.empty())
 		return mCurrentSet->SetOverlay(NULL);
 	else
 	{
-		Page* page = mBaseSet ? mBaseSet->FindPage(name) : NULL;
+		Page* page = mCurrentSet ? mCurrentSet->FindPage(name) : NULL;
 		return mCurrentSet->SetOverlay(page);
 	}
 }
@@ -1350,24 +1590,6 @@ const ResourceManager* PageManager::GetResources()
 	return (mCurrentSet ? mCurrentSet->GetResources() : NULL);
 }
 
-int PageManager::SwitchToConsole(void)
-{
-	PageSet* console = new PageSet(NULL);
-
-	mCurrentSet = console;
-	return 0;
-}
-
-int PageManager::EndConsole(void)
-{
-	if (mCurrentSet && mBaseSet) {
-		delete mCurrentSet;
-		mCurrentSet = mBaseSet;
-		return 0;
-	}
-	return -1;
-}
-
 int PageManager::IsCurrentPage(Page* page)
 {
 	return (mCurrentSet ? mCurrentSet->IsCurrentPage(page) : 0);
@@ -1375,22 +1597,31 @@ int PageManager::IsCurrentPage(Page* page)
 
 int PageManager::Render(void)
 {
+	if (blankTimer.isScreenOff())
+		return 0;
+
 	int res = (mCurrentSet ? mCurrentSet->Render() : -1);
-	if(mMouseCursor)
+	if (mMouseCursor)
 		mMouseCursor->Render();
 	return res;
 }
 
 HardwareKeyboard *PageManager::GetHardwareKeyboard()
 {
-	if(!mHardwareKeyboard)
+	if (!mHardwareKeyboard)
 		mHardwareKeyboard = new HardwareKeyboard();
 	return mHardwareKeyboard;
 }
 
 xml_node<>* PageManager::FindStyle(std::string name)
 {
-	for (std::vector<xml_node<>*>::iterator itr = mCurrentSet->styles.begin(); itr != mCurrentSet->styles.end(); itr++) {
+	if (!currentLoadingContext)
+	{
+		LOGERR("FindStyle works only while loading a theme.\n");
+		return NULL;
+	}
+
+	for (std::vector<xml_node<>*>::iterator itr = currentLoadingContext->styles.begin(); itr != currentLoadingContext->styles.end(); itr++) {
 		xml_node<>* node = (*itr)->first_node("style");
 
 		while (node) {
@@ -1407,14 +1638,14 @@ xml_node<>* PageManager::FindStyle(std::string name)
 
 MouseCursor *PageManager::GetMouseCursor()
 {
-	if(!mMouseCursor)
+	if (!mMouseCursor)
 		mMouseCursor = new MouseCursor(gr_fb_width(), gr_fb_height());
 	return mMouseCursor;
 }
 
 void PageManager::LoadCursorData(xml_node<>* node)
 {
-	if(!mMouseCursor)
+	if (!mMouseCursor)
 		mMouseCursor = new MouseCursor(gr_fb_width(), gr_fb_height());
 
 	mMouseCursor->LoadData(node);
@@ -1422,15 +1653,18 @@ void PageManager::LoadCursorData(xml_node<>* node)
 
 int PageManager::Update(void)
 {
-	if(blankTimer.isScreenOff())
+	if (blankTimer.isScreenOff())
 		return 0;
+
+	if (RunReload())
+		return -2;
 
 	int res = (mCurrentSet ? mCurrentSet->Update() : -1);
 
-	if(mMouseCursor)
+	if (mMouseCursor)
 	{
 		int c_res = mMouseCursor->Update();
-		if(c_res > res)
+		if (c_res > res)
 			res = c_res;
 	}
 	return res;
@@ -1446,9 +1680,9 @@ int PageManager::NotifyKey(int key, bool down)
 	return (mCurrentSet ? mCurrentSet->NotifyKey(key, down) : -1);
 }
 
-int PageManager::NotifyKeyboard(int key)
+int PageManager::NotifyCharInput(int ch)
 {
-	return (mCurrentSet ? mCurrentSet->NotifyKeyboard(key) : -1);
+	return (mCurrentSet ? mCurrentSet->NotifyCharInput(ch) : -1);
 }
 
 int PageManager::SetKeyBoardFocus(int inFocus)
@@ -1459,6 +1693,12 @@ int PageManager::SetKeyBoardFocus(int inFocus)
 int PageManager::NotifyVarChange(std::string varName, std::string value)
 {
 	return (mCurrentSet ? mCurrentSet->NotifyVarChange(varName, value) : -1);
+}
+
+void PageManager::AddStringResource(std::string resource_source, std::string resource_name, std::string value)
+{
+	if (mCurrentSet)
+		mCurrentSet->AddStringResource(resource_source, resource_name, value);
 }
 
 extern "C" void gui_notifyVarChange(const char *name, const char* value)

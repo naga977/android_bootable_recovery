@@ -1,3 +1,21 @@
+/*
+	Copyright 2017 TeamWin
+	This file is part of TWRP/TeamWin Recovery Project.
+
+	TWRP is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	TWRP is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 // resources.hpp - Base classes for resource management of GUI
 
 #ifndef _RESOURCE_HEADER
@@ -6,8 +24,8 @@
 #include <string>
 #include <vector>
 #include <map>
-
-struct ZipArchive;
+#include "rapidxml.hpp"
+#include "../zipwrap.hpp"
 
 extern "C" {
 #include "../minuitwrp/minui.h"
@@ -17,7 +35,7 @@ extern "C" {
 class Resource
 {
 public:
-	Resource(xml_node<>* node, ZipArchive* pZip);
+	Resource(xml_node<>* node, ZipWrap* pZip);
 	virtual ~Resource() {}
 
 public:
@@ -27,38 +45,38 @@ private:
 	std::string mName;
 
 protected:
-	static int ExtractResource(ZipArchive* pZip, std::string folderName, std::string fileName, std::string fileExtn, std::string destFile);
-	static void LoadImage(ZipArchive* pZip, std::string file, gr_surface* source);
+	static int ExtractResource(ZipWrap* pZip, std::string folderName, std::string fileName, std::string fileExtn, std::string destFile);
+	static void LoadImage(ZipWrap* pZip, std::string file, gr_surface* surface);
 	static void CheckAndScaleImage(gr_surface source, gr_surface* destination, int retain_aspect);
 };
 
 class FontResource : public Resource
 {
 public:
-	enum Type
-	{
-		TYPE_TWRP,
-#ifndef TW_DISABLE_TTF
-		TYPE_TTF,
-#endif
-	};
-
-	FontResource(xml_node<>* node, ZipArchive* pZip);
+	FontResource(xml_node<>* node, ZipWrap* pZip);
 	virtual ~FontResource();
 
 public:
 	void* GetResource() { return this ? mFont : NULL; }
-	int GetHeight() { return gr_getMaxFontHeight(this ? mFont : NULL); }
+	int GetHeight() { return gr_ttf_getMaxFontHeight(this ? mFont : NULL); }
+	void Override(xml_node<>* node, ZipWrap* pZip);
 
 protected:
 	void* mFont;
-	Type m_type;
+
+private:
+	void LoadFont(xml_node<>* node, ZipWrap* pZip);
+	void DeleteFont();
+
+private:
+	int origFontSize;
+	void* origFont;
 };
 
 class ImageResource : public Resource
 {
 public:
-	ImageResource(xml_node<>* node, ZipArchive* pZip);
+	ImageResource(xml_node<>* node, ZipWrap* pZip);
 	virtual ~ImageResource();
 
 public:
@@ -73,7 +91,7 @@ protected:
 class AnimationResource : public Resource
 {
 public:
-	AnimationResource(xml_node<>* node, ZipArchive* pZip);
+	AnimationResource(xml_node<>* node, ZipWrap* pZip);
 	virtual ~AnimationResource();
 
 public:
@@ -92,19 +110,26 @@ class ResourceManager
 public:
 	ResourceManager();
 	virtual ~ResourceManager();
-	void LoadResources(xml_node<>* resList, ZipArchive* pZip);
+	void AddStringResource(std::string resource_source, std::string resource_name, std::string value);
+	void LoadResources(xml_node<>* resList, ZipWrap* pZip, std::string resource_source);
 
 public:
 	FontResource* FindFont(const std::string& name) const;
 	ImageResource* FindImage(const std::string& name) const;
 	AnimationResource* FindAnimation(const std::string& name) const;
 	std::string FindString(const std::string& name) const;
+	std::string FindString(const std::string& name, const std::string& default_string) const;
+	void DumpStrings() const;
 
 private:
+	struct string_resource_struct {
+		std::string value;
+		std::string source;
+	};
 	std::vector<FontResource*> mFonts;
 	std::vector<ImageResource*> mImages;
 	std::vector<AnimationResource*> mAnimations;
-	std::map<std::string, std::string> mStrings;
+	std::map<std::string, string_resource_struct> mStrings;
 };
 
 #endif  // _RESOURCE_HEADER

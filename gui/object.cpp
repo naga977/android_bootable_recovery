@@ -1,25 +1,30 @@
-// checkbox.cpp - GUICheckbox object
+/*
+	Copyright 2017 TeamWin
+	This file is part of TWRP/TeamWin Recovery Project.
 
-#include <stdarg.h>
+	TWRP is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	TWRP is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+// object.cpp - GUIObject base class
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <fcntl.h>
-#include <sys/reboot.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <time.h>
-#include <unistd.h>
-#include <stdlib.h>
-
 #include <string>
 
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 #include "../variables.h"
 }
 
@@ -30,16 +35,15 @@ extern "C" {
 GUIObject::GUIObject(xml_node<>* node)
 {
 	mConditionsResult = true;
+	if (node)
+		LoadConditions(node, mConditions);
+}
 
-	// Break out early, it's too hard to check if valid every step
-	if (!node)		return;
-
-	// First, get the action
+void GUIObject::LoadConditions(xml_node<>* node, std::vector<Condition>& conditions)
+{
 	xml_node<>* condition = FindNode(node, "conditions");
 	if (condition)  condition = FindNode(condition, "condition");
 	else			condition = FindNode(node, "condition");
-
-	if (!condition)	return;
 
 	while (condition)
 	{
@@ -57,7 +61,7 @@ GUIObject::GUIObject(xml_node<>* node)
 		attr = condition->first_attribute("var2");
 		if (attr)   cond.mVar2 = attr->value();
 
-		mConditions.push_back(cond);
+		conditions.push_back(cond);
 
 		condition = condition->next_sibling("condition");
 	}
@@ -108,6 +112,10 @@ bool GUIObject::isConditionTrue(Condition* condition)
 	if (DataManager::GetValue(condition->mVar2, var2))
 		var2 = condition->mVar2;
 
+	if (var2.substr(0, 2) == "{@")
+		// translate resource string in value
+		var2 = gui_parse_text(var2);
+
 	// This is a special case, we stat the file and that determines our result
 	if (var1 == "fileexists")
 	{
@@ -155,15 +163,21 @@ bool GUIObject::isConditionValid()
 	return !mConditions.empty();
 }
 
-int GUIObject::NotifyVarChange(const std::string& varName, const std::string& value)
+int GUIObject::NotifyVarChange(const std::string& varName, const std::string& value __unused)
 {
-	mConditionsResult = true;
+	mConditionsResult = UpdateConditions(mConditions, varName);
+	return 0;
+}
+
+bool GUIObject::UpdateConditions(std::vector<Condition>& conditions, const std::string& varName)
+{
+	bool result = true;
 
 	const bool varNameEmpty = varName.empty();
 	std::vector<Condition>::iterator iter;
-	for (iter = mConditions.begin(); iter != mConditions.end(); ++iter)
+	for (iter = conditions.begin(); iter != conditions.end(); ++iter)
 	{
-		if(varNameEmpty && iter->mCompareOp == "modified")
+		if (varNameEmpty && iter->mCompareOp == "modified")
 		{
 			string val;
 
@@ -176,13 +190,13 @@ int GUIObject::NotifyVarChange(const std::string& varName, const std::string& va
 			iter->mLastVal = val;
 		}
 
-		if(varNameEmpty || iter->mVar1 == varName || iter->mVar2 == varName)
+		if (varNameEmpty || iter->mVar1 == varName || iter->mVar2 == varName)
 			iter->mLastResult = isConditionTrue(&(*iter));
 
-		if(!iter->mLastResult)
-			mConditionsResult = false;
+		if (!iter->mLastResult)
+			result = false;
 	}
-	return 0;
+	return result;
 }
 
 bool GUIObject::isMounted(string vol)

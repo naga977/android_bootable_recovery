@@ -35,14 +35,16 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cctype>
 #include <algorithm>
 #include "twrp-functions.hpp"
 #include "twcommon.h"
+#include "gui/gui.hpp"
 #ifndef BUILD_TWRPTAR_MAIN
 #include "data.hpp"
 #include "partitions.hpp"
 #include "variables.h"
-#include "bootloader.h"
+#include "bootloader_message_twrp/include/bootloader_message_twrp/bootloader_message.h"
 #include "cutils/properties.h"
 #include "cutils/android_reboot.h"
 #include <sys/reboot.h>
@@ -50,10 +52,10 @@
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
 	#include "openaes/inc/oaes_lib.h"
 #endif
+#include "set_metadata.h"
 
 extern "C" {
 	#include "libcrecovery/common.h"
-	#include "set_metadata.h"
 }
 
 /* Execute a command */
@@ -63,7 +65,7 @@ int TWFunc::Exec_Cmd(const string& cmd, string &result) {
 	int ret = 0;
 	exec = __popen(cmd.c_str(), "r");
 	if (!exec) return -1;
-	while(!feof(exec)) {
+	while (!feof(exec)) {
 		if (fgets(buffer, 128, exec) != NULL) {
 			result += buffer;
 		}
@@ -95,7 +97,7 @@ int TWFunc::Exec_Cmd(const string& cmd) {
 }
 
 // Returns "file.name" from a full /path/to/file.name
-string TWFunc::Get_Filename(string Path) {
+string TWFunc::Get_Filename(const string& Path) {
 	size_t pos = Path.find_last_of("/");
 	if (pos != string::npos) {
 		string Filename;
@@ -106,7 +108,7 @@ string TWFunc::Get_Filename(string Path) {
 }
 
 // Returns "/path/to/" from a full /path/to/file.name
-string TWFunc::Get_Path(string Path) {
+string TWFunc::Get_Path(const string& Path) {
 	size_t pos = Path.find_last_of("/");
 	if (pos != string::npos) {
 		string Pathonly;
@@ -122,12 +124,12 @@ int TWFunc::Wait_For_Child(pid_t pid, int *status, string Child_Name) {
 	rc_pid = waitpid(pid, status, 0);
 	if (rc_pid > 0) {
 		if (WIFSIGNALED(*status)) {
-			LOGERR("%s process ended with signal: %d\n", Child_Name.c_str(), WTERMSIG(*status)); // Seg fault or some other non-graceful termination
+			gui_msg(Msg(msg::kError, "pid_signal={1} process ended with signal: {2}")(Child_Name)(WTERMSIG(*status))); // Seg fault or some other non-graceful termination
 			return -1;
 		} else if (WEXITSTATUS(*status) == 0) {
 			LOGINFO("%s process ended with RC=%d\n", Child_Name.c_str(), WEXITSTATUS(*status)); // Success
 		} else {
-			LOGERR("%s process ended with ERROR=%d\n", Child_Name.c_str(), WEXITSTATUS(*status)); // Graceful exit, but there was an error
+			gui_msg(Msg(msg::kError, "pid_error={1} process ended with ERROR: {2}")(Child_Name)(WEXITSTATUS(*status))); // Graceful exit, but there was an error
 			return -1;
 		}
 	} else { // no PID returned
@@ -141,8 +143,42 @@ int TWFunc::Wait_For_Child(pid_t pid, int *status, string Child_Name) {
 	return 0;
 }
 
+int TWFunc::Wait_For_Child_Timeout(pid_t pid, int *status, const string& Child_Name, int timeout) {
+	pid_t retpid = waitpid(pid, status, WNOHANG);
+	for (; retpid == 0 && timeout; --timeout) {
+		sleep(1);
+		retpid = waitpid(pid, status, WNOHANG);
+	}
+	if (retpid == 0 && timeout == 0) {
+		LOGERR("%s took too long, killing process\n", Child_Name.c_str());
+		kill(pid, SIGKILL);
+		int died = 0;
+		for (timeout = 5; retpid == 0 && timeout; --timeout) {
+			sleep(1);
+			retpid = waitpid(pid, status, WNOHANG);
+		}
+		if (retpid)
+			LOGINFO("Child process killed successfully\n");
+		else
+			LOGINFO("Child process took too long to kill, may be a zombie process\n");
+		return -1;
+	} else if (retpid > 0) {
+		if (WIFSIGNALED(*status)) {
+			gui_msg(Msg(msg::kError, "pid_signal={1} process ended with signal: {2}")(Child_Name)(WTERMSIG(*status))); // Seg fault or some other non-graceful termination
+			return -1;
+		}
+	} else if (retpid < 0) { // no PID returned
+		if (errno == ECHILD)
+			LOGERR("%s no child process exist\n", Child_Name.c_str());
+		else {
+			LOGERR("%s Unexpected error %d\n", Child_Name.c_str(), errno);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 bool TWFunc::Path_Exists(string Path) {
-	// Check to see if the Path exists
 	struct stat st;
 	if (stat(Path.c_str(), &st) != 0)
 		return false;
@@ -150,7 +186,7 @@ bool TWFunc::Path_Exists(string Path) {
 		return true;
 }
 
-int TWFunc::Get_File_Type(string fn) {
+Archive_Type TWFunc::Get_File_Type(string fn) {
 	string::size_type i = 0;
 	int firstbyte = 0, secondbyte = 0;
 	char header[3];
@@ -163,13 +199,10 @@ int TWFunc::Get_File_Type(string fn) {
 	secondbyte = header[++i] & 0xff;
 
 	if (firstbyte == 0x1f && secondbyte == 0x8b)
-		return 1; // Compressed
+		return COMPRESSED;
 	else if (firstbyte == 0x4f && secondbyte == 0x41)
-		return 2; // Encrypted
-	else
-		return 0; // Unknown
-
-	return 0;
+		return ENCRYPTED;
+	return UNCOMPRESSED; // default
 }
 
 int TWFunc::Try_Decrypting_File(string fn, string password) {
@@ -181,20 +214,20 @@ int TWFunc::Try_Decrypting_File(string fn, string password) {
 	uint8_t *buffer_out = NULL;
 	uint8_t *ptr = NULL;
 	size_t read_len = 0, out_len = 0;
-	int firstbyte = 0, secondbyte = 0, key_len;
+	int firstbyte = 0, secondbyte = 0;
 	size_t _j = 0;
 	size_t _key_data_len = 0;
 
 	// mostly kanged from OpenAES oaes.c
-	for( _j = 0; _j < 32; _j++ )
+	for ( _j = 0; _j < 32; _j++ )
 		_key_data[_j] = _j + 1;
 	_key_data_len = password.size();
-	if( 16 >= _key_data_len )
+	if ( 16 >= _key_data_len )
 		_key_data_len = 16;
-	else if( 24 >= _key_data_len )
+	else if ( 24 >= _key_data_len )
 		_key_data_len = 24;
 	else
-	_key_data_len = 32;
+		_key_data_len = 32;
 	memcpy(_key_data, password.c_str(), password.size());
 
 	ctx = oaes_alloc();
@@ -207,35 +240,41 @@ int TWFunc::Try_Decrypting_File(string fn, string password) {
 
 	f = fopen(fn.c_str(), "rb");
 	if (f == NULL) {
-		LOGERR("Failed to open '%s' to try decrypt\n", fn.c_str());
+		LOGERR("Failed to open '%s' to try decrypt: %s\n", fn.c_str(), strerror(errno));
+		oaes_free(&ctx);
 		return -1;
 	}
 	read_len = fread(buffer, sizeof(uint8_t), 4096, f);
 	if (read_len <= 0) {
-		LOGERR("Read size during try decrypt failed\n");
+		LOGERR("Read size during try decrypt failed: %s\n", strerror(errno));
 		fclose(f);
+		oaes_free(&ctx);
 		return -1;
 	}
 	if (oaes_decrypt(ctx, buffer, read_len, NULL, &out_len) != OAES_RET_SUCCESS) {
 		LOGERR("Error: Failed to retrieve required buffer size for trying decryption.\n");
 		fclose(f);
+		oaes_free(&ctx);
 		return -1;
 	}
 	buffer_out = (uint8_t *) calloc(out_len, sizeof(char));
 	if (buffer_out == NULL) {
 		LOGERR("Failed to allocate output buffer for try decrypt.\n");
 		fclose(f);
+		oaes_free(&ctx);
 		return -1;
 	}
 	if (oaes_decrypt(ctx, buffer, read_len, buffer_out, &out_len) != OAES_RET_SUCCESS) {
 		LOGERR("Failed to decrypt file '%s'\n", fn.c_str());
 		fclose(f);
 		free(buffer_out);
+		oaes_free(&ctx);
 		return 0;
 	}
 	fclose(f);
+	oaes_free(&ctx);
 	if (out_len < 2) {
-		LOGINFO("Successfully decrypted '%s' but read length %i too small.\n", fn.c_str(), out_len);
+		LOGINFO("Successfully decrypted '%s' but read length too small.\n", fn.c_str());
 		free(buffer_out);
 		return 1; // Decrypted successfully
 	}
@@ -265,7 +304,7 @@ int TWFunc::Try_Decrypting_File(string fn, string password) {
 #endif
 }
 
-unsigned long TWFunc::Get_File_Size(string Path) {
+unsigned long TWFunc::Get_File_Size(const string& Path) {
 	struct stat st;
 
 	if (stat(Path.c_str(), &st) != 0)
@@ -278,13 +317,13 @@ std::string TWFunc::Remove_Trailing_Slashes(const std::string& path, bool leaveL
 	std::string res;
 	size_t last_idx = 0, idx = 0;
 
-	while(last_idx != std::string::npos)
+	while (last_idx != std::string::npos)
 	{
-		if(last_idx != 0)
+		if (last_idx != 0)
 			res += '/';
 
 		idx = path.find_first_of('/', last_idx);
-		if(idx == std::string::npos) {
+		if (idx == std::string::npos) {
 			res += path.substr(last_idx, idx);
 			break;
 		}
@@ -293,9 +332,16 @@ std::string TWFunc::Remove_Trailing_Slashes(const std::string& path, bool leaveL
 		last_idx = path.find_first_not_of('/', idx);
 	}
 
-	if(leaveLast)
+	if (leaveLast)
 		res += '/';
 	return res;
+}
+
+void TWFunc::Strip_Quotes(char* &str) {
+	if (strlen(str) > 0 && str[0] == '\"')
+		str++;
+	if (strlen(str) > 0 && str[strlen(str)-1] == '\"')
+		str[strlen(str)-1] = 0;
 }
 
 vector<string> TWFunc::split_string(const string &in, char del, bool skip_empty) {
@@ -307,13 +353,13 @@ vector<string> TWFunc::split_string(const string &in, char del, bool skip_empty)
 	string field;
 	istringstream f(in);
 	if (del == '\n') {
-		while(getline(f, field)) {
+		while (getline(f, field)) {
 			if (field.empty() && skip_empty)
 				continue;
-		res.push_back(field);
+			res.push_back(field);
 		}
 	} else {
-		while(getline(f, field, del)) {
+		while (getline(f, field, del)) {
 			if (field.empty() && skip_empty)
 				continue;
 			res.push_back(field);
@@ -322,10 +368,29 @@ vector<string> TWFunc::split_string(const string &in, char del, bool skip_empty)
 	return res;
 }
 
+timespec TWFunc::timespec_diff(timespec& start, timespec& end)
+{
+	timespec temp;
+	if ((end.tv_nsec-start.tv_nsec)<0) {
+		temp.tv_sec = end.tv_sec-start.tv_sec-1;
+		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec-start.tv_sec;
+		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
+	}
+	return temp;
+}
+
+int32_t TWFunc::timespec_diff_ms(timespec& start, timespec& end)
+{
+	return ((end.tv_sec * 1000) + end.tv_nsec/1000000) -
+			((start.tv_sec * 1000) + start.tv_nsec/1000000);
+}
+
 #ifndef BUILD_TWRPTAR_MAIN
 
 // Returns "/path" from a full /path/to/file.name
-string TWFunc::Get_Root_Path(string Path) {
+string TWFunc::Get_Root_Path(const string& Path) {
 	string Local_Path = Path;
 
 	// Make sure that we have a leading slash
@@ -349,73 +414,66 @@ void TWFunc::install_htc_dumlock(void) {
 	if (!PartitionManager.Mount_By_Path("/data", true))
 		return;
 
-	gui_print("Installing HTC Dumlock to system...\n");
+	gui_msg("install_dumlock=Installing HTC Dumlock to system...");
 	copy_file(TWHTCD_PATH "htcdumlocksys", "/system/bin/htcdumlock", 0755);
 	if (!Path_Exists("/system/bin/flash_image")) {
-		gui_print("Installing flash_image...\n");
+		LOGINFO("Installing flash_image...\n");
 		copy_file(TWHTCD_PATH "flash_imagesys", "/system/bin/flash_image", 0755);
 		need_libs = 1;
 	} else
-		gui_print("flash_image is already installed, skipping...\n");
+		LOGINFO("flash_image is already installed, skipping...\n");
 	if (!Path_Exists("/system/bin/dump_image")) {
-		gui_print("Installing dump_image...\n");
+		LOGINFO("Installing dump_image...\n");
 		copy_file(TWHTCD_PATH "dump_imagesys", "/system/bin/dump_image", 0755);
 		need_libs = 1;
 	} else
-		gui_print("dump_image is already installed, skipping...\n");
+		LOGINFO("dump_image is already installed, skipping...\n");
 	if (need_libs) {
-		gui_print("Installing libs needed for flash_image and dump_image...\n");
+		LOGINFO("Installing libs needed for flash_image and dump_image...\n");
 		copy_file(TWHTCD_PATH "libbmlutils.so", "/system/lib/libbmlutils.so", 0644);
 		copy_file(TWHTCD_PATH "libflashutils.so", "/system/lib/libflashutils.so", 0644);
 		copy_file(TWHTCD_PATH "libmmcutils.so", "/system/lib/libmmcutils.so", 0644);
 		copy_file(TWHTCD_PATH "libmtdutils.so", "/system/lib/libmtdutils.so", 0644);
 	}
-	gui_print("Installing HTC Dumlock app...\n");
+	LOGINFO("Installing HTC Dumlock app...\n");
 	mkdir("/data/app", 0777);
 	unlink("/data/app/com.teamwin.htcdumlock*");
 	copy_file(TWHTCD_PATH "HTCDumlock.apk", "/data/app/com.teamwin.htcdumlock.apk", 0777);
 	sync();
-	gui_print("HTC Dumlock is installed.\n");
+	gui_msg("done=Done.");
 }
 
 void TWFunc::htc_dumlock_restore_original_boot(void) {
 	if (!PartitionManager.Mount_By_Path("/sdcard", true))
 		return;
 
-	gui_print("Restoring original boot...\n");
+	gui_msg("dumlock_restore=Restoring original boot...");
 	Exec_Cmd("htcdumlock restore");
-	gui_print("Original boot restored.\n");
+	gui_msg("done=Done.");
 }
 
 void TWFunc::htc_dumlock_reflash_recovery_to_boot(void) {
 	if (!PartitionManager.Mount_By_Path("/sdcard", true))
 		return;
-	gui_print("Reflashing recovery to boot...\n");
+	gui_msg("dumlock_reflash=Reflashing recovery to boot...");
 	Exec_Cmd("htcdumlock recovery noreboot");
-	gui_print("Recovery is flashed to boot.\n");
+	gui_msg("done=Done.");
 }
 
 int TWFunc::Recursive_Mkdir(string Path) {
-	string pathCpy = Path;
-	string wholePath;
-	size_t pos = pathCpy.find("/", 2);
-
-	while (pos != string::npos)
-	{
-		wholePath = pathCpy.substr(0, pos);
-		if (!TWFunc::Path_Exists(wholePath)) {
-			if (mkdir(wholePath.c_str(), 0777)) {
-				LOGERR("Unable to create folder: %s  (errno=%d)\n", wholePath.c_str(), errno);
+	std::vector<std::string> parts = Split_String(Path, "/", true);
+	std::string cur_path;
+	for (size_t i = 0; i < parts.size(); ++i) {
+		cur_path += "/" + parts[i];
+		if (!TWFunc::Path_Exists(cur_path)) {
+			if (mkdir(cur_path.c_str(), 0777)) {
+				gui_msg(Msg(msg::kError, "create_folder_strerr=Can not create '{1}' folder ({2}).")(cur_path)(strerror(errno)));
 				return false;
 			} else {
-				tw_set_default_metadata(wholePath.c_str());
+				tw_set_default_metadata(cur_path.c_str());
 			}
 		}
-
-		pos = pathCpy.find("/", pos + 1);
 	}
-	if (mkdir(wholePath.c_str(), 0777) && errno != EEXIST)
-		return false;
 	return true;
 }
 
@@ -475,20 +533,30 @@ void TWFunc::Update_Log_File(void) {
 		chown("/cache/recovery/log", 1000, 1000);
 		chmod("/cache/recovery/log", 0600);
 		chmod("/cache/recovery/last_log", 0640);
+	} else if (PartitionManager.Mount_By_Path("/data", false) && TWFunc::Path_Exists("/data/cache/recovery/.")) {
+		Copy_Log(TMP_LOG_FILE, "/data/cache/recovery/log");
+		copy_file("/data/cache/recovery/log", "/data/cache/recovery/last_log", 600);
+		chown("/data/cache/recovery/log", 1000, 1000);
+		chmod("/data/cache/recovery/log", 0600);
+		chmod("/data/cache/recovery/last_log", 0640);
 	} else {
-		LOGINFO("Failed to mount /cache for TWFunc::Update_Log_File\n");
+		LOGINFO("Failed to mount /cache or find /data/cache for TWFunc::Update_Log_File\n");
 	}
 
 	// Reset bootloader message
 	TWPartition* Part = PartitionManager.Find_Partition_By_Path("/misc");
 	if (Part != NULL) {
-		struct bootloader_message boot;
-		memset(&boot, 0, sizeof(boot));
-		if (set_bootloader_message(&boot) != 0)
-			LOGERR("Unable to set bootloader message.\n");
+		std::string err;
+		if (!clear_bootloader_message((void*)&err)) {
+			if (err == "no misc device set") {
+				LOGINFO("%s\n", err.c_str());
+			} else {
+				LOGERR("%s\n", err.c_str());
+			}
+		}
 	}
 
-	if (PartitionManager.Mount_By_Path("/cache", true)) {
+	if (PartitionManager.Mount_By_Path("/cache", false)) {
 		if (unlink("/cache/recovery/command") && errno != ENOENT) {
 			LOGINFO("Can't unlink %s\n", "/cache/recovery/command");
 		}
@@ -499,16 +567,17 @@ void TWFunc::Update_Log_File(void) {
 
 void TWFunc::Update_Intent_File(string Intent) {
 	if (PartitionManager.Mount_By_Path("/cache", false) && !Intent.empty()) {
-		TWFunc::write_file("/cache/recovery/intent", Intent);
+		TWFunc::write_to_file("/cache/recovery/intent", Intent);
 	}
 }
 
 // reboot: Reboot the system. Return -1 on error, no return on success
 int TWFunc::tw_reboot(RebootCommand command)
 {
+	DataManager::Flush();
+	Update_Log_File();
 	// Always force a sync before we reboot
 	sync();
-	Update_Log_File();
 
 	switch (command) {
 		case rb_current:
@@ -564,10 +633,10 @@ void TWFunc::check_and_run_script(const char* script_file, const char* display_n
 	// Check for and run startup script if script exists
 	struct stat st;
 	if (stat(script_file, &st) == 0) {
-		gui_print("Running %s script...\n", display_name);
+		gui_msg(Msg("run_script=Running {1} script...")(display_name));
 		chmod(script_file, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 		TWFunc::Exec_Cmd(script_file);
-		gui_print("\nFinished running %s script.\n", display_name);
+		gui_msg("done=Done.");
 	}
 }
 
@@ -577,7 +646,7 @@ int TWFunc::removeDir(const string path, bool skipParent) {
 	string new_path;
 
 	if (d == NULL) {
-		LOGERR("Error opening dir: '%s'\n", path.c_str());
+		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(path)(strerror(errno)));
 		return -1;
 	}
 
@@ -690,7 +759,7 @@ int TWFunc::read_file(string fn, uint64_t& results) {
 	return -1;
 }
 
-int TWFunc::write_file(string fn, string& line) {
+int TWFunc::write_to_file(const string& fn, const string& line) {
 	FILE *file;
 	file = fopen(fn.c_str(), "w");
 	if (file != NULL) {
@@ -700,25 +769,6 @@ int TWFunc::write_file(string fn, string& line) {
 	}
 	LOGINFO("Cannot find file %s\n", fn.c_str());
 	return -1;
-}
-
-timespec TWFunc::timespec_diff(timespec& start, timespec& end)
-{
-	timespec temp;
-	if ((end.tv_nsec-start.tv_nsec)<0) {
-		temp.tv_sec = end.tv_sec-start.tv_sec-1;
-		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
-	} else {
-		temp.tv_sec = end.tv_sec-start.tv_sec;
-		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
-	}
-	return temp;
-}
-
-int32_t TWFunc::timespec_diff_ms(timespec& start, timespec& end)
-{
-	return ((end.tv_sec * 1000) + end.tv_nsec/1000000) -
-			((start.tv_sec * 1000) + start.tv_nsec/1000000);
 }
 
 bool TWFunc::Install_SuperSU(void) {
@@ -736,7 +786,7 @@ bool TWFunc::Try_Decrypting_Backup(string Restore_Path, string Password) {
 	Restore_Path += "/";
 	d = opendir(Restore_Path.c_str());
 	if (d == NULL) {
-		LOGERR("Error opening '%s'\n", Restore_Path.c_str());
+		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(Restore_Path)(strerror(errno)));
 		return false;
 	}
 
@@ -744,7 +794,7 @@ bool TWFunc::Try_Decrypting_Backup(string Restore_Path, string Password) {
 	while ((de = readdir(d)) != NULL) {
 		Filename = Restore_Path;
 		Filename += de->d_name;
-		if (TWFunc::Get_File_Type(Filename) == 2) {
+		if (TWFunc::Get_File_Type(Filename) == ENCRYPTED) {
 			if (TWFunc::Try_Decrypting_File(Filename, Password) < 2) {
 				DataManager::SetValue("tw_restore_password", ""); // Clear the bad password
 				DataManager::SetValue("tw_restore_display", "");  // Also clear the display mask
@@ -773,7 +823,10 @@ string TWFunc::System_Property_Get(string Prop_Name) {
 	string propvalue;
 	if (!PartitionManager.Mount_By_Path("/system", true))
 		return propvalue;
-	if (TWFunc::read_file("/system/build.prop", buildprop) != 0) {
+	string prop_file = "/system/build.prop";
+	if (!TWFunc::Path_Exists(prop_file))
+		prop_file = "/system/system/build.prop"; // for devices with system as a root file system (e.g. Pixel)
+	if (TWFunc::read_file(prop_file, buildprop) != 0) {
 		LOGINFO("Unable to open /system/build.prop for getting '%s'.\n", Prop_Name.c_str());
 		DataManager::SetValue(TW_BACKUP_NAME, Get_Current_Date());
 		if (!mount_state)
@@ -805,6 +858,10 @@ void TWFunc::Auto_Generate_Backup_Name() {
 		DataManager::SetValue(TW_BACKUP_NAME, Get_Current_Date());
 		return;
 	}
+	else {
+		//remove periods from build display so it doesn't confuse the extension code
+		propvalue.erase(remove(propvalue.begin(), propvalue.end(), '.'), propvalue.end());
+	}
 	string Backup_Name = Get_Current_Date();
 	Backup_Name += "_" + propvalue;
 	if (Backup_Name.size() > MAX_BACKUP_NAME_LEN)
@@ -824,9 +881,12 @@ void TWFunc::Auto_Generate_Backup_Name() {
 	}
 }
 
-void TWFunc::Fixup_Time_On_Boot()
+void TWFunc::Fixup_Time_On_Boot(const string& time_paths /* = "" */)
 {
 #ifdef QCOM_RTC_FIX
+	static bool fixed = false;
+	if (fixed)
+		return;
 
 	LOGINFO("TWFunc::Fixup_Time: Pre-fix date and time: %s\n", TWFunc::Get_Current_Date().c_str());
 
@@ -847,6 +907,7 @@ void TWFunc::Fixup_Time_On_Boot()
 		if (tv.tv_sec > 1405209403) { // Anything older then 12 Jul 2014 23:56:43 GMT will do nicely thank you ;)
 
 			LOGINFO("TWFunc::Fixup_Time: Date and time corrected: %s\n", TWFunc::Get_Current_Date().c_str());
+			fixed = true;
 			return;
 
 		}
@@ -868,67 +929,76 @@ void TWFunc::Fixup_Time_On_Boot()
 	// Like, ats_1 is for modem and ats_2 is for TOD (time of day?).
 	// Look at file time_genoff.h in CodeAurora, qcom-opensource/time-services
 
-	static const char *paths[] = { "/data/system/time/", "/data/time/"  };
+	std::vector<std::string> paths; // space separated list of paths
+	if (time_paths.empty()) {
+		paths = Split_String("/data/system/time/ /data/time/", " ");
+		if (!PartitionManager.Mount_By_Path("/data", false))
+			return;
+	} else {
+		// When specific path(s) are used, Fixup_Time needs those
+		// partitions to already be mounted!
+		paths = Split_String(time_paths, " ");
+	}
 
 	FILE *f;
-	DIR *d;
 	offset = 0;
 	struct dirent *dt;
 	std::string ats_path;
 
-	if(!PartitionManager.Mount_By_Path("/data", false))
-		return;
-
 	// Prefer ats_2, it seems to be the one we want according to logcat on hammerhead
 	// - it is the one for ATS_TOD (time of day?).
 	// However, I never saw a device where the offset differs between ats files.
-	for(size_t i = 0; i < (sizeof(paths)/sizeof(paths[0])); ++i)
+	for (size_t i = 0; i < paths.size(); ++i)
 	{
-		DIR *d = opendir(paths[i]);
-		if(!d)
+		DIR *d = opendir(paths[i].c_str());
+		if (!d)
 			continue;
 
-		while((dt = readdir(d)))
+		while ((dt = readdir(d)))
 		{
-			if(dt->d_type != DT_REG || strncmp(dt->d_name, "ats_", 4) != 0)
+			if (dt->d_type != DT_REG || strncmp(dt->d_name, "ats_", 4) != 0)
 				continue;
 
-			if(ats_path.empty() || strcmp(dt->d_name, "ats_2") == 0)
-				ats_path = std::string(paths[i]).append(dt->d_name);
+			if (ats_path.empty() || strcmp(dt->d_name, "ats_2") == 0)
+				ats_path = paths[i] + dt->d_name;
 		}
 
 		closedir(d);
 	}
 
-	if(ats_path.empty())
-	{
+	if (ats_path.empty()) {
 		LOGINFO("TWFunc::Fixup_Time: no ats files found, leaving untouched!\n");
-		return;
-	}
-
-	f = fopen(ats_path.c_str(), "r");
-	if(!f)
-	{
+	} else if ((f = fopen(ats_path.c_str(), "r")) == NULL) {
 		LOGINFO("TWFunc::Fixup_Time: failed to open file %s\n", ats_path.c_str());
-		return;
-	}
-
-	if(fread(&offset, sizeof(offset), 1, f) != 1)
-	{
+	} else if (fread(&offset, sizeof(offset), 1, f) != 1) {
 		LOGINFO("TWFunc::Fixup_Time: failed load uint64 from file %s\n", ats_path.c_str());
 		fclose(f);
-		return;
-	}
-	fclose(f);
+	} else {
+		fclose(f);
 
-	LOGINFO("TWFunc::Fixup_Time: Setting time offset from file %s, offset %llu\n", ats_path.c_str(), offset);
+		LOGINFO("TWFunc::Fixup_Time: Setting time offset from file %s, offset %llu\n", ats_path.c_str(), (unsigned long long) offset);
+		DataManager::SetValue("tw_qcom_ats_offset", (unsigned long long) offset, 1);
+		fixed = true;
+	}
+
+	if (!fixed) {
+		// Failed to get offset from ats file, check twrp settings
+		unsigned long long value;
+		if (DataManager::GetValue("tw_qcom_ats_offset", value) < 0) {
+			return;
+		} else {
+			offset = (uint64_t) value;
+			LOGINFO("TWFunc::Fixup_Time: Setting time offset from twrp setting file, offset %llu\n", (unsigned long long) offset);
+			// Do not consider the settings file as a definitive answer, keep fixed=false so next run will try ats files again
+		}
+	}
 
 	gettimeofday(&tv, NULL);
 
 	tv.tv_sec += offset/1000;
 	tv.tv_usec += (offset%1000)*1000;
 
-	while(tv.tv_usec >= 1000000)
+	while (tv.tv_usec >= 1000000)
 	{
 		++tv.tv_sec;
 		tv.tv_usec -= 1000000;
@@ -937,7 +1007,6 @@ void TWFunc::Fixup_Time_On_Boot()
 	settimeofday(&tv, NULL);
 
 	LOGINFO("TWFunc::Fixup_Time: Date and time corrected: %s\n", TWFunc::Get_Current_Date().c_str());
-
 #endif
 }
 
@@ -946,13 +1015,13 @@ std::vector<std::string> TWFunc::Split_String(const std::string& str, const std:
 	std::vector<std::string> res;
 	size_t idx = 0, idx_last = 0;
 
-	while(idx < str.size())
+	while (idx < str.size())
 	{
 		idx = str.find_first_of(delimiter, idx_last);
-		if(idx == std::string::npos)
+		if (idx == std::string::npos)
 			idx = str.size();
 
-		if(idx-idx_last != 0 || !removeEmpty)
+		if (idx-idx_last != 0 || !removeEmpty)
 			res.push_back(str.substr(idx_last, idx-idx_last));
 
 		idx_last = idx + delimiter.size();
@@ -966,12 +1035,12 @@ bool TWFunc::Create_Dir_Recursive(const std::string& path, mode_t mode, uid_t ui
 	std::vector<std::string> parts = Split_String(path, "/");
 	std::string cur_path;
 	struct stat info;
-	for(size_t i = 0; i < parts.size(); ++i)
+	for (size_t i = 0; i < parts.size(); ++i)
 	{
 		cur_path += "/" + parts[i];
-		if(stat(cur_path.c_str(), &info) < 0 || !S_ISDIR(info.st_mode))
+		if (stat(cur_path.c_str(), &info) < 0 || !S_ISDIR(info.st_mode))
 		{
-			if(mkdir(cur_path.c_str(), mode) < 0)
+			if (mkdir(cur_path.c_str(), mode) < 0)
 				return false;
 			chown(cur_path.c_str(), uid, gid);
 		}
@@ -981,20 +1050,19 @@ bool TWFunc::Create_Dir_Recursive(const std::string& path, mode_t mode, uid_t ui
 
 int TWFunc::Set_Brightness(std::string brightness_value)
 {
+	int result = -1;
+	std::string secondary_brightness_file;
 
-	std::string brightness_file = DataManager::GetStrValue("tw_brightness_file");;
-
-	if (brightness_file.compare("/nobrightness") != 0) {
-		std::string secondary_brightness_file = DataManager::GetStrValue("tw_secondary_brightness_file");
+	if (DataManager::GetIntValue("tw_has_brightnesss_file")) {
 		LOGINFO("TWFunc::Set_Brightness: Setting brightness control to %s\n", brightness_value.c_str());
-		int result = TWFunc::write_file(brightness_file, brightness_value);
-		if (secondary_brightness_file != "") {
-			LOGINFO("TWFunc::Set_Brightness: Setting SECONDARY brightness control to %s\n", brightness_value.c_str());
-			TWFunc::write_file(secondary_brightness_file, brightness_value);
+		result = TWFunc::write_to_file(DataManager::GetStrValue("tw_brightness_file"), brightness_value);
+		DataManager::GetValue("tw_secondary_brightness_file", secondary_brightness_file);
+		if (!secondary_brightness_file.empty()) {
+			LOGINFO("TWFunc::Set_Brightness: Setting secondary brightness control to %s\n", brightness_value.c_str());
+			TWFunc::write_to_file(secondary_brightness_file, brightness_value);
 		}
-		return result;
 	}
-	return -1;
+	return result;
 }
 
 bool TWFunc::Toggle_MTP(bool enable) {
@@ -1036,11 +1104,59 @@ void TWFunc::Disable_Stock_Recovery_Replace(void) {
 		// Disable flashing of stock recovery
 		if (TWFunc::Path_Exists("/system/recovery-from-boot.p")) {
 			rename("/system/recovery-from-boot.p", "/system/recovery-from-boot.bak");
-			gui_print("Renamed stock recovery file in /system to prevent\nthe stock ROM from replacing TWRP.\n");
+			gui_msg("rename_stock=Renamed stock recovery file in /system to prevent the stock ROM from replacing TWRP.");
 			sync();
 		}
 		PartitionManager.UnMount_By_Path("/system", false);
 	}
 }
 
+unsigned long long TWFunc::IOCTL_Get_Block_Size(const char* block_device) {
+	unsigned long block_device_size;
+	int ret = 0;
+
+	int fd = open(block_device, O_RDONLY);
+	if (fd < 0) {
+		LOGINFO("Find_Partition_Size: Failed to open '%s', (%s)\n", block_device, strerror(errno));
+	} else {
+		ret = ioctl(fd, BLKGETSIZE, &block_device_size);
+		close(fd);
+		if (ret) {
+			LOGINFO("Find_Partition_Size: ioctl error: (%s)\n", strerror(errno));
+		} else {
+			return (unsigned long long)(block_device_size) * 512LLU;
+		}
+	}
+	return 0;
+}
+
+void TWFunc::copy_kernel_log(string curr_storage) {
+	std::string dmesgDst = curr_storage + "/dmesg.log";
+	std::string dmesgCmd = "/sbin/dmesg";
+
+	std::string result;
+	Exec_Cmd(dmesgCmd, result);
+	write_to_file(dmesgDst, result);
+	gui_msg(Msg("copy_kernel_log=Copied kernel log to {1}")(dmesgDst));
+	tw_set_default_metadata(dmesgDst.c_str());
+}
+
+bool TWFunc::isNumber(string strtocheck) {
+	int num = 0;
+	std::istringstream iss(strtocheck);
+
+	if (!(iss >> num).fail())
+		return true;
+	else
+		return false;
+}
+
+int TWFunc::stream_adb_backup(string &Restore_Name) {
+	string cmd = "/sbin/bu --twrp stream " + Restore_Name;
+	LOGINFO("stream_adb_backup: %s\n", cmd.c_str());
+	int ret = TWFunc::Exec_Cmd(cmd);
+	if (ret != 0)
+		return -1;
+	return ret;
+}
 #endif // ndef BUILD_TWRPTAR_MAIN

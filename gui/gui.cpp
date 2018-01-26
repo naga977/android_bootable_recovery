@@ -33,14 +33,13 @@
 #include <sys/mount.h>
 #include <time.h>
 #include <unistd.h>
-#include <stdlib.h>
 
 extern "C"
 {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 #include <pixelflinger/pixelflinger.h>
 }
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
@@ -62,30 +61,30 @@ extern "C"
 #define LOGEVENT(...) do {} while (0)
 #endif
 
-const static int CURTAIN_FADE = 32;
-
 using namespace rapidxml;
 
 // Global values
-static gr_surface gCurtain = NULL;
 static int gGuiInitialized = 0;
-static TWAtomicInt gGuiConsoleRunning;
-static TWAtomicInt gGuiConsoleTerminate;
 static TWAtomicInt gForceRender;
-const int gNoAnimation = 1;
 blanktimer blankTimer;
 int ors_read_fd = -1;
+static FILE* orsout = NULL;
 static float scale_theme_w = 1;
 static float scale_theme_h = 1;
 
 // Needed by pages.cpp too
 int gGuiRunning = 0;
 
+int g_pty_fd = -1;  // set by terminal on init
+void terminal_pty_read();
+
+int select_fd = 0;
+
 static int gRecorder = -1;
 
 extern "C" void gr_write_frame_to_file(int fd);
 
-void flip(void)
+static void flip(void)
 {
 	if (gRecorder != -1)
 	{
@@ -103,80 +102,6 @@ void rapidxml::parse_error_handler(const char *what, void *where)
 	fprintf(stderr, "  Start of string: %s\n",(char *) where);
 	LOGERR("Error parsing XML file.\n");
 	//abort();
-}
-
-static void curtainSet()
-{
-	gr_color(0, 0, 0, 255);
-	gr_fill(0, 0, gr_fb_width(), gr_fb_height());
-	gr_blit(gCurtain, 0, 0, gr_get_width(gCurtain), gr_get_height(gCurtain), TW_X_OFFSET, TW_Y_OFFSET);
-	gr_flip();
-}
-
-static void curtainRaise(gr_surface surface)
-{
-	int sy = 0;
-	int h = gr_get_height(gCurtain) - 1;
-	int w = gr_get_width(gCurtain);
-	int fy = 1;
-
-	int msw = gr_get_width(surface);
-	int msh = gr_get_height(surface);
-	int CURTAIN_RATE = msh / 30;
-
-	if (gNoAnimation == 0)
-	{
-		for (; h > 0; h -= CURTAIN_RATE, sy += CURTAIN_RATE, fy += CURTAIN_RATE)
-		{
-			gr_blit(surface, 0, 0, msw, msh, 0, 0);
-			gr_blit(gCurtain, 0, sy, w, h, 0, 0);
-			gr_flip();
-		}
-	}
-	gr_blit(surface, 0, 0, msw, msh, 0, 0);
-	flip();
-}
-
-void curtainClose()
-{
-#if 0
-	int w = gr_get_width(gCurtain);
-	int h = 1;
-	int sy = gr_get_height(gCurtain) - 1;
-	int fbh = gr_fb_height();
-	int CURTAIN_RATE = fbh / 30;
-
-	if (gNoAnimation == 0)
-	{
-		for (; h < fbh; h += CURTAIN_RATE, sy -= CURTAIN_RATE)
-		{
-			gr_blit(gCurtain, 0, sy, w, h, 0, 0);
-			gr_flip();
-		}
-		gr_blit(gCurtain, 0, 0, gr_get_width(gCurtain),
-		gr_get_height(gCurtain), 0, 0);
-		gr_flip();
-
-		if (gRecorder != -1)
-			close(gRecorder);
-
-		int fade;
-		for (fade = 16; fade < 255; fade += CURTAIN_FADE)
-		{
-			gr_blit(gCurtain, 0, 0, gr_get_width(gCurtain),
-			gr_get_height(gCurtain), 0, 0);
-			gr_color(0, 0, 0, fade);
-			gr_fill(0, 0, gr_fb_width(), gr_fb_height());
-			gr_flip();
-		}
-		gr_color(0, 0, 0, 255);
-		gr_fill(0, 0, gr_fb_width(), gr_fb_height());
-		gr_flip();
-	}
-#else
-	gr_blit(gCurtain, 0, 0, gr_get_width(gCurtain), gr_get_height(gCurtain), 0, 0);
-	gr_flip();
-#endif
 }
 
 class InputHandler
@@ -281,7 +206,9 @@ bool InputHandler::processInput(int timeout_ms)
 		break;
 	}
 
-	blankTimer.resetTimerAndUnblank();
+	if (ev.code != KEY_POWER && ev.code > KEY_RESERVED)
+		blankTimer.resetTimerAndUnblank();
+
 	return true;  // we got an event, so there might be more in the queue
 }
 
@@ -376,15 +303,15 @@ void InputHandler::process_EV_KEY(input_event& ev)
 	// Handle key-press here
 	LOGEVENT("TOUCH_KEY: %d\n", ev.code);
 	// Left mouse button is treated as a touch
-	if(ev.code == BTN_LEFT)
+	if (ev.code == BTN_LEFT)
 	{
 		MouseCursor *cursor = PageManager::GetMouseCursor();
-		if(ev.value == 1)
+		if (ev.value == 1)
 		{
 			cursor->GetPos(x, y);
 			doTouchStart();
 		}
-		else if(touch_status)
+		else if (touch_status)
 		{
 			// Left mouse button was previously pressed and now is
 			// being released so send a TOUCH_RELEASE
@@ -399,9 +326,9 @@ void InputHandler::process_EV_KEY(input_event& ev)
 		}
 	}
 	// side mouse button, often used for "back" function
-	else if(ev.code == BTN_SIDE)
+	else if (ev.code == BTN_SIDE)
 	{
-		if(ev.value == 1)
+		if (ev.value == 1)
 			kb->KeyDown(KEY_BACK);
 		else
 			kb->KeyUp(KEY_BACK);
@@ -442,12 +369,12 @@ void InputHandler::process_EV_REL(input_event& ev)
 	// Mouse movement
 	MouseCursor *cursor = PageManager::GetMouseCursor();
 	LOGEVENT("EV_REL %d %d\n", ev.code, ev.value);
-	if(ev.code == REL_X)
+	if (ev.code == REL_X)
 		cursor->Move(ev.value, 0);
-	else if(ev.code == REL_Y)
+	else if (ev.code == REL_Y)
 		cursor->Move(0, ev.value);
 
-	if(touch_status) {
+	if (touch_status) {
 		cursor->GetPos(x, y);
 		LOGEVENT("Mouse TOUCH_DRAG: %d, %d\n", x, y);
 		key_status = KS_NONE;
@@ -469,9 +396,18 @@ void InputHandler::handleDrag()
 	}
 }
 
+void set_select_fd() {
+	select_fd = ors_read_fd + 1;
+	if (g_pty_fd >= select_fd)
+		select_fd = g_pty_fd + 1;
+	if (PartitionManager.uevent_pfd.fd >= select_fd)
+		select_fd = PartitionManager.uevent_pfd.fd + 1;
+}
+
 static void setup_ors_command()
 {
 	ors_read_fd = -1;
+	set_select_fd();
 
 	unlink(ORS_INPUT_FILE);
 	if (mkfifo(ORS_INPUT_FILE, 06660) != 0) {
@@ -491,15 +427,31 @@ static void setup_ors_command()
 		unlink(ORS_INPUT_FILE);
 		unlink(ORS_OUTPUT_FILE);
 	}
+	set_select_fd();
+}
+
+// callback called after a CLI command was executed
+static void ors_command_done()
+{
+	gui_set_FILE(NULL);
+	fclose(orsout);
+	orsout = NULL;
+
+	if (DataManager::GetIntValue("tw_page_done") == 0) {
+		// The select function will return ready to read and the
+		// read function will return errno 19 no such device unless
+		// we set everything up all over again.
+		close(ors_read_fd);
+		setup_ors_command();
+	}
 }
 
 static void ors_command_read()
 {
-	FILE* orsout;
-	char command[1024], result[512];
-	int set_page_done = 0, read_ret = 0;
+	char command[1024];
+	int read_ret = read(ors_read_fd, &command, sizeof(command));
 
-	if ((read_ret = read(ors_read_fd, &command, sizeof(command))) > 0) {
+	if (read_ret > 0) {
 		command[1022] = '\n';
 		command[1023] = '\0';
 		LOGINFO("Command '%s' received\n", command);
@@ -507,61 +459,45 @@ static void ors_command_read()
 		if (!orsout) {
 			close(ors_read_fd);
 			ors_read_fd = -1;
+			set_select_fd();
 			LOGINFO("Unable to fopen %s\n", ORS_OUTPUT_FILE);
 			unlink(ORS_INPUT_FILE);
 			unlink(ORS_OUTPUT_FILE);
 			return;
 		}
 		if (DataManager::GetIntValue("tw_busy") != 0) {
-			strcpy(result, "Failed, operation in progress\n");
-			fprintf(orsout, "%s", result);
+			fputs("Failed, operation in progress\n", orsout);
 			LOGINFO("Command cannot be performed, operation in progress.\n");
+			fclose(orsout);
 		} else {
-			if (gui_console_only() == 0) {
-				LOGINFO("Console started successfully\n");
+			if (strlen(command) == 11 && strncmp(command, "dumpstrings", 11) == 0) {
 				gui_set_FILE(orsout);
-				if (strlen(command) > 11 && strncmp(command, "runscript", 9) == 0) {
-					char* filename = command + 11;
-					if (OpenRecoveryScript::copy_script_file(filename) == 0) {
-						LOGERR("Unable to copy script file\n");
-					} else {
-						OpenRecoveryScript::run_script_file();
-					}
-				} else if (strlen(command) > 5 && strncmp(command, "get", 3) == 0) {
-					char* varname = command + 4;
-					string temp;
-					DataManager::GetValue(varname, temp);
-					gui_print("%s = %s\n", varname, temp.c_str());
-				} else if (strlen(command) > 9 && strncmp(command, "decrypt", 7) == 0) {
-					char* pass = command + 8;
-					gui_print("Attempting to decrypt data partition via command line.\n");
-					if (PartitionManager.Decrypt_Device(pass) == 0) {
-						set_page_done = 1;
-					}
-				} else if (OpenRecoveryScript::Insert_ORS_Command(command)) {
-					OpenRecoveryScript::run_script_file();
-				}
-				gui_set_FILE(NULL);
-				gGuiConsoleTerminate.set_value(1);
+				PageManager::GetResources()->DumpStrings();
+				ors_command_done();
+			} else {
+				// mirror output messages
+				gui_set_FILE(orsout);
+				// close orsout and restart listener after command is done
+				OpenRecoveryScript::Call_After_CLI_Command(ors_command_done);
+				// run the command in a threaded action...
+				DataManager::SetValue("tw_action", "twcmd");
+				DataManager::SetValue("tw_action_param", command);
+				// ...and switch back to the current page when finished
+				std::string currentPage = PageManager::GetCurrentPage();
+				DataManager::SetValue("tw_has_action2", "1");
+				DataManager::SetValue("tw_action2", "page");
+				DataManager::SetValue("tw_action2_param", currentPage);
+				DataManager::SetValue("tw_action_text1", gui_lookup("running_recovery_commands", "Running Recovery Commands"));
+				DataManager::SetValue("tw_action_text2", "");
+				gui_changePage("singleaction_page");
+				// now immediately return to the GUI main loop (the action runs in the background thread)
+				// put all things that need to be done after the command is finished into ors_command_done, not here
 			}
 		}
-		fclose(orsout);
-		LOGINFO("Done reading ORS command from command line\n");
-		if (set_page_done) {
-			DataManager::SetValue("tw_page_done", 1);
-		} else {
-			// The select function will return ready to read and the
-			// read function will return errno 19 no such device unless
-			// we set everything up all over again.
-			close(ors_read_fd);
-			setup_ors_command();
-		}
-	} else {
-		LOGINFO("ORS command line read returned an error: %i, %i, %s\n", read_ret, errno, strerror(errno));
 	}
-	return;
 }
 
+// Get and dispatch input events until it's time to draw the next frame
 // This special function will return immediately the first time, but then
 // always returns 1/30th of a second (or immediately if called later) from
 // the last time it was called
@@ -611,29 +547,18 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 	DataManager::SetValue("tw_page_done", 0);
 	DataManager::SetValue("tw_gui_done", 0);
 
-	if (page_name)
+	if (page_name) {
+		PageManager::SetStartPage(page_name);
 		gui_changePage(page_name);
-
-	// Raise the curtain
-	if (gCurtain != NULL)
-	{
-		gr_surface surface;
-
-		PageManager::Render();
-		gr_get_surface(&surface);
-		curtainRaise(surface);
-		gr_free_surface(surface);
 	}
 
 	gGuiRunning = 1;
 
 	DataManager::SetValue("tw_loaded", 1);
 
-#ifndef TW_OEM_BUILD
 	struct timeval timeout;
 	fd_set fdset;
 	int has_data = 0;
-#endif
 
 	int input_timeout_ms = 0;
 	int idle_frames = 0;
@@ -641,21 +566,29 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 	for (;;)
 	{
 		loopTimer(input_timeout_ms);
+		FD_ZERO(&fdset);
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 1;
+		if (g_pty_fd > 0) {
+			FD_SET(g_pty_fd, &fdset);
+		}
+		if (PartitionManager.uevent_pfd.fd > 0) {
+			FD_SET(PartitionManager.uevent_pfd.fd, &fdset);
+		}
 #ifndef TW_OEM_BUILD
-		if (ors_read_fd > 0) {
-			FD_ZERO(&fdset);
+		if (ors_read_fd > 0 && !orsout) { // orsout is non-NULL if a command is still running
 			FD_SET(ors_read_fd, &fdset);
-			timeout.tv_sec = 0;
-			timeout.tv_usec = 1;
-			has_data = select(ors_read_fd+1, &fdset, NULL, NULL, &timeout);
-			if (has_data > 0) {
-				ors_command_read();
-			}
 		}
 #endif
-
-		if (gGuiConsoleRunning.get_value()) {
-			continue;
+		// TODO: combine this select with the poll done by input handling
+		has_data = select(select_fd, &fdset, NULL, NULL, &timeout);
+		if (has_data > 0) {
+			if (g_pty_fd > 0 && FD_ISSET(g_pty_fd, &fdset))
+				terminal_pty_read();
+			if (PartitionManager.uevent_pfd.fd > 0 && FD_ISSET(PartitionManager.uevent_pfd.fd, &fdset))
+				PartitionManager.read_uevent();
+			if (ors_read_fd > 0 && !orsout && FD_ISSET(ors_read_fd, &fdset))
+				ors_command_read();
 		}
 
 		if (!gForceRender.get_value())
@@ -663,6 +596,8 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 			int ret = PageManager::Update();
 			if (ret == 0)
 				++idle_frames;
+			else if (ret == -2)
+				break; // Theme reload failure
 			else
 				idle_frames = 0;
 			// due to possible animation objects, we need to delay activating the input timeout
@@ -714,6 +649,7 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 	if (ors_read_fd > 0)
 		close(ors_read_fd);
 	ors_read_fd = -1;
+	set_select_fd();
 	gGuiRunning = 0;
 	return 0;
 }
@@ -740,26 +676,43 @@ int gui_changeOverlay(std::string overlay)
 	return 0;
 }
 
-int gui_changePackage(std::string newPackage)
-{
-	PageManager::SelectPackage(newPackage);
-	gForceRender.set_value(1);
-	return 0;
-}
-
 std::string gui_parse_text(std::string str)
 {
 	// This function parses text for DataManager values encompassed by %value% in the XML
 	// and string resources (%@resource_name%)
-	size_t pos = 0;
+	size_t pos = 0, next, end;
 
 	while (1)
 	{
-		size_t next = str.find('%', pos);
+		next = str.find("{@", pos);
+		if (next == std::string::npos)
+			break;
+
+		end = str.find('}', next + 1);
+		if (end == std::string::npos)
+			break;
+
+		std::string var = str.substr(next + 2, (end - next) - 2);
+		str.erase(next, (end - next) + 1);
+
+		size_t default_loc = var.find('=', 0);
+		std::string lookup;
+		if (default_loc == std::string::npos) {
+			str.insert(next, PageManager::GetResources()->FindString(var));
+		} else {
+			lookup = var.substr(0, default_loc);
+			std::string default_string = var.substr(default_loc + 1, var.size() - default_loc - 1);
+			str.insert(next, PageManager::GetResources()->FindString(lookup, default_string));
+		}
+	}
+	pos = 0;
+	while (1)
+	{
+		next = str.find('%', pos);
 		if (next == std::string::npos)
 			return str;
 
-		size_t end = str.find('%', next + 1);
+		end = str.find('%', next + 1);
 		if (end == std::string::npos)
 			return str;
 
@@ -785,32 +738,25 @@ std::string gui_parse_text(std::string str)
 	}
 }
 
+std::string gui_lookup(const std::string& resource_name, const std::string& default_value) {
+	return PageManager::GetResources()->FindString(resource_name, default_value);
+}
+
 extern "C" int gui_init(void)
 {
 	gr_init();
-	std::string curtain_path = TWRES "images/curtain.jpg";
-	gr_surface source_Surface = NULL;
+	TWFunc::Set_Brightness(DataManager::GetStrValue("tw_brightness"));
 
-	if (res_create_surface(curtain_path.c_str(), &source_Surface))
-	{
-		printf("Unable to locate '%s'\nDid you set a TW_THEME in your config files?\n", curtain_path.c_str());
-		return -1;
+	// load and show splash screen
+	if (PageManager::LoadPackage("splash", TWRES "splash.xml", "splash")) {
+		LOGERR("Failed to load splash screen XML.\n");
 	}
-	if (gr_get_width(source_Surface) != gr_fb_width() || gr_get_height(source_Surface) != gr_fb_height()) {
-		// We need to scale the curtain to fit the screen
-		float scale_w = (float)gr_fb_width() / (float)gr_get_width(source_Surface);
-		float scale_h = (float)gr_fb_height() / (float)gr_get_height(source_Surface);
-		if (res_scale_surface(source_Surface, &gCurtain, scale_w, scale_h)) {
-			LOGINFO("Failed to scale curtain\n");
-			gCurtain = source_Surface;
-		} else {
-			LOGINFO("Scaling the curtain width %fx and height %fx\n", scale_w, scale_h);
-		}
-	} else {
-		gCurtain = source_Surface;
+	else {
+		PageManager::SelectPackage("splash");
+		PageManager::Render();
+		flip();
+		PageManager::ReleasePackage("splash");
 	}
-
-	curtainSet();
 
 	ev_init();
 	return 0;
@@ -826,14 +772,14 @@ extern "C" int gui_loadResources(void)
 	{
 		if (PageManager::LoadPackage("TWRP", TWRES "ui.xml", "decrypt"))
 		{
-			LOGERR("Failed to load base packages.\n");
+			gui_err("base_pkg_err=Failed to load base packages.");
 			goto error;
 		}
 		else
 			check = 1;
 	}
 
-	if (check == 0 && PageManager::LoadPackage("TWRP", "/script/ui.xml", "main"))
+	if (check == 0)
 	{
 		std::string theme_path;
 
@@ -847,10 +793,9 @@ extern "C" int gui_loadResources(void)
 				retry_count--;
 			}
 
-			if (!PartitionManager.Mount_Settings_Storage(false))
+			if (!PartitionManager.Mount_Settings_Storage(true))
 			{
-				LOGERR("Unable to mount %s during GUI startup.\n",
-					   theme_path.c_str());
+				LOGINFO("Unable to mount %s during GUI startup.\n", theme_path.c_str());
 				check = 1;
 			}
 		}
@@ -861,7 +806,7 @@ extern "C" int gui_loadResources(void)
 #endif // ifndef TW_OEM_BUILD
 			if (PageManager::LoadPackage("TWRP", TWRES "ui.xml", "main"))
 			{
-				LOGERR("Failed to load base packages.\n");
+				gui_err("base_pkg_err=Failed to load base packages.");
 				goto error;
 			}
 #ifndef TW_OEM_BUILD
@@ -884,7 +829,7 @@ extern "C" int gui_loadCustomResources(void)
 {
 #ifndef TW_OEM_BUILD
 	if (!PartitionManager.Mount_Settings_Storage(false)) {
-		LOGERR("Unable to mount settings storage during GUI startup.\n");
+		LOGINFO("Unable to mount settings storage during GUI startup.\n");
 		return -1;
 	}
 
@@ -896,7 +841,7 @@ extern "C" int gui_loadCustomResources(void)
 		if (PageManager::ReloadPackage("TWRP", theme_path)) {
 			// Custom theme failed to load, try to load stock theme
 			if (PageManager::ReloadPackage("TWRP", TWRES "ui.xml")) {
-				LOGERR("Failed to load base packages.\n");
+				gui_err("base_pkg_err=Failed to load base packages.");
 				goto error;
 			}
 		}
@@ -914,18 +859,13 @@ error:
 
 extern "C" int gui_start(void)
 {
-	return gui_startPage(NULL, 1, 0);
+	return gui_startPage("main", 1, 0);
 }
 
 extern "C" int gui_startPage(const char *page_name, const int allow_commands, int stop_on_page_done)
 {
 	if (!gGuiInitialized)
 		return -1;
-
-	gGuiConsoleTerminate.set_value(1);
-
-	while (gGuiConsoleRunning.get_value())
-		usleep(10000);
 
 	// Set the default package
 	PageManager::SelectPackage("TWRP");
@@ -946,60 +886,6 @@ extern "C" int gui_startPage(const char *page_name, const int allow_commands, in
 	return runPages(page_name, stop_on_page_done);
 }
 
-static void * console_thread(void *cookie)
-{
-	PageManager::SwitchToConsole();
-
-	while (!gGuiConsoleTerminate.get_value())
-	{
-		loopTimer(0);
-
-		if (!gForceRender.get_value())
-		{
-			int ret;
-
-			ret = PageManager::Update();
-			if (ret > 1)
-				PageManager::Render();
-
-			if (ret > 0)
-				flip();
-
-			if (ret < 0)
-				LOGERR("An update request has failed.\n");
-		}
-		else
-		{
-			gForceRender.set_value(0);
-			PageManager::Render();
-			flip();
-		}
-	}
-	gGuiConsoleRunning.set_value(0);
-	gForceRender.set_value(1); // this will kickstart the GUI to render again
-	PageManager::EndConsole();
-	LOGINFO("Console stopping\n");
-	return NULL;
-}
-
-extern "C" int gui_console_only(void)
-{
-	if (!gGuiInitialized)
-		return -1;
-
-	gGuiConsoleTerminate.set_value(0);
-
-	if (gGuiConsoleRunning.get_value())
-		return 0;
-
-	gGuiConsoleRunning.set_value(1);
-
-	// Start by spinning off an input handler.
-	pthread_t t;
-	pthread_create(&t, NULL, console_thread, NULL);
-
-	return 0;
-}
 
 extern "C" void set_scale_values(float w, float h)
 {

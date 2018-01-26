@@ -1,3 +1,21 @@
+/*
+	Copyright 2017 TeamWin
+	This file is part of TWRP/TeamWin Recovery Project.
+
+	TWRP is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	TWRP is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 // resource.cpp - Source to manage GUI resources
 
 #include <stdarg.h>
@@ -10,68 +28,58 @@
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <fcntl.h>
 
-#include "../minzip/Zip.h"
+#include "../zipwrap.hpp"
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 #include "gui.h"
 }
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
 
 #define TMP_RESOURCE_NAME   "/tmp/extract.bin"
 
-Resource::Resource(xml_node<>* node, ZipArchive* pZip)
+Resource::Resource(xml_node<>* node, ZipWrap* pZip __unused)
 {
 	if (node && node->first_attribute("name"))
 		mName = node->first_attribute("name")->value();
 }
 
-int Resource::ExtractResource(ZipArchive* pZip, std::string folderName, std::string fileName, std::string fileExtn, std::string destFile)
+int Resource::ExtractResource(ZipWrap* pZip, std::string folderName, std::string fileName, std::string fileExtn, std::string destFile)
 {
 	if (!pZip)
 		return -1;
 
 	std::string src = folderName + "/" + fileName + fileExtn;
-
-	const ZipEntry* binary = mzFindZipEntry(pZip, src.c_str());
-	if (binary == NULL) {
+	if (!pZip->ExtractEntry(src, destFile, 0666))
 		return -1;
-	}
-
-	unlink(destFile.c_str());
-	int fd = creat(destFile.c_str(), 0666);
-	if (fd < 0)
-		return -1;
-
-	int ret = 0;
-	if (!mzExtractZipEntryToFile(pZip, binary, fd))
-		ret = -1;
-
-	close(fd);
-	return ret;
+	return 0;
 }
 
-void Resource::LoadImage(ZipArchive* pZip, std::string file, gr_surface* source)
+void Resource::LoadImage(ZipWrap* pZip, std::string file, gr_surface* surface)
 {
+	int rc = 0;
 	if (ExtractResource(pZip, "images", file, ".png", TMP_RESOURCE_NAME) == 0)
 	{
-		res_create_surface(TMP_RESOURCE_NAME, source);
+		rc = res_create_surface(TMP_RESOURCE_NAME, surface);
 		unlink(TMP_RESOURCE_NAME);
 	}
 	else if (ExtractResource(pZip, "images", file, "", TMP_RESOURCE_NAME) == 0)
 	{
 		// JPG includes the .jpg extension in the filename so extension should be blank
-		res_create_surface(TMP_RESOURCE_NAME, source);
+		rc = res_create_surface(TMP_RESOURCE_NAME, surface);
 		unlink(TMP_RESOURCE_NAME);
 	}
 	else if (!pZip)
 	{
 		// File name in xml may have included .png so try without adding .png
-		res_create_surface(file.c_str(), source);
+		rc = res_create_surface(file.c_str(), surface);
 	}
+	if (rc != 0)
+		LOGINFO("Failed to load image from %s%s, error %d\n", file.c_str(), pZip ? " (zip)" : "", rc);
 }
 
 void Resource::CheckAndScaleImage(gr_surface source, gr_surface* destination, int retain_aspect)
@@ -97,8 +105,15 @@ void Resource::CheckAndScaleImage(gr_surface source, gr_surface* destination, in
 	}
 }
 
-FontResource::FontResource(xml_node<>* node, ZipArchive* pZip)
+FontResource::FontResource(xml_node<>* node, ZipWrap* pZip)
  : Resource(node, pZip)
+{
+	origFontSize = 0;
+	origFont = NULL;
+	LoadFont(node, pZip);
+}
+
+void FontResource::LoadFont(xml_node<>* node, ZipWrap* pZip)
 {
 	std::string file;
 	xml_attribute<>* attr;
@@ -113,73 +128,72 @@ FontResource::FontResource(xml_node<>* node, ZipArchive* pZip)
 
 	file = attr->value();
 
-#ifndef TW_DISABLE_TTF
-	if(file.size() >= 4 && file.compare(file.size()-4, 4, ".ttf") == 0)
+	if (file.size() >= 4 && file.compare(file.size()-4, 4, ".ttf") == 0)
 	{
-		m_type = TYPE_TTF;
+		int font_size = 0;
 
-		attr = node->first_attribute("size");
-		if(!attr)
-			return;
+		if (origFontSize != 0) {
+			attr = node->first_attribute("scale");
+			if (attr == NULL)
+				return;
+			font_size = origFontSize * atoi(attr->value()) / 100;
+		} else {
+			attr = node->first_attribute("size");
+			if (attr == NULL)
+				return;
+			font_size = scale_theme_min(atoi(attr->value()));
+			origFontSize = font_size;
+		}
 
-		int size = scale_theme_min(atoi(attr->value()));
 		int dpi = 300;
 
 		attr = node->first_attribute("dpi");
-		if(attr)
+		if (attr)
 			dpi = atoi(attr->value());
 
-		if (ExtractResource(pZip, "fonts", file, "", TMP_RESOURCE_NAME) == 0)
+		// we can't use TMP_RESOURCE_NAME here because the ttf subsystem is caching the name and scaling needs to reload the font
+		std::string tmpname = "/tmp/" + file;
+		if (ExtractResource(pZip, "fonts", file, "", tmpname) == 0)
 		{
-			mFont = gr_ttf_loadFont(TMP_RESOURCE_NAME, size, dpi);
-			unlink(TMP_RESOURCE_NAME);
+			mFont = gr_ttf_loadFont(tmpname.c_str(), font_size, dpi);
 		}
 		else
 		{
 			file = std::string(TWRES "fonts/") + file;
-			mFont = gr_ttf_loadFont(file.c_str(), size, dpi);
+			mFont = gr_ttf_loadFont(file.c_str(), font_size, dpi);
 		}
 	}
 	else
-#endif
 	{
-		m_type = TYPE_TWRP;
-
-		if(file.size() >= 4 && file.compare(file.size()-4, 4, ".ttf") == 0)
-		{
-			attr = node->first_attribute("fallback");
-			if (!attr)
-				return;
-
-			file = attr->value();
-		}
-
-		if (ExtractResource(pZip, "fonts", file, ".dat", TMP_RESOURCE_NAME) == 0)
-		{
-			mFont = gr_loadFont(TMP_RESOURCE_NAME);
-			unlink(TMP_RESOURCE_NAME);
-		}
-		else
-		{
-			mFont = gr_loadFont(file.c_str());
-		}
+		LOGERR("Non-TTF fonts are no longer supported.\n");
 	}
+}
+
+void FontResource::DeleteFont() {
+	if (mFont)
+		gr_ttf_freeFont(mFont);
+	mFont = NULL;
+	if (origFont)
+		gr_ttf_freeFont(origFont);
+	origFont = NULL;
+}
+
+void FontResource::Override(xml_node<>* node, ZipWrap* pZip) {
+	if (!origFont) {
+		origFont = mFont;
+	} else if (mFont) {
+		gr_ttf_freeFont(mFont);
+		mFont = NULL;
+	}
+	LoadFont(node, pZip);
 }
 
 FontResource::~FontResource()
 {
-	if(mFont)
-	{
-#ifndef TW_DISABLE_TTF
-		if(m_type == TYPE_TTF)
-			gr_ttf_freeFont(mFont);
-		else
-#endif
-			gr_freeFont(mFont);
-	}
+	DeleteFont();
 }
 
-ImageResource::ImageResource(xml_node<>* node, ZipArchive* pZip)
+ImageResource::ImageResource(xml_node<>* node, ZipWrap* pZip)
  : Resource(node, pZip)
 {
 	std::string file;
@@ -210,7 +224,7 @@ ImageResource::~ImageResource()
 		res_free_surface(mSurface);
 }
 
-AnimationResource::AnimationResource(xml_node<>* node, ZipArchive* pZip)
+AnimationResource::AnimationResource(xml_node<>* node, ZipWrap* pZip)
  : Resource(node, pZip)
 {
 	std::string file;
@@ -280,17 +294,58 @@ AnimationResource* ResourceManager::FindAnimation(const std::string& name) const
 
 std::string ResourceManager::FindString(const std::string& name) const
 {
-	std::map<std::string, std::string>::const_iterator it = mStrings.find(name);
-	if (it != mStrings.end())
-		return it->second;
+	if (this != NULL) {
+		std::map<std::string, string_resource_struct>::const_iterator it = mStrings.find(name);
+		if (it != mStrings.end())
+			return it->second.value;
+		LOGERR("String resource '%s' not found. No default value.\n", name.c_str());
+		PageManager::AddStringResource("NO DEFAULT", name, "[" + name + ("]"));
+	} else {
+		LOGINFO("String resources not loaded when looking for '%s'. No default value.\n", name.c_str());
+	}
 	return "[" + name + ("]");
+}
+
+std::string ResourceManager::FindString(const std::string& name, const std::string& default_string) const
+{
+	if (this != NULL) {
+		std::map<std::string, string_resource_struct>::const_iterator it = mStrings.find(name);
+		if (it != mStrings.end())
+			return it->second.value;
+		LOGERR("String resource '%s' not found. Using default value.\n", name.c_str());
+		PageManager::AddStringResource("DEFAULT", name, default_string);
+	} else {
+		LOGINFO("String resources not loaded when looking for '%s'. Using default value.\n", name.c_str());
+	}
+	return default_string;
+}
+
+void ResourceManager::DumpStrings() const
+{
+	if (this == NULL) {
+		gui_print("No string resources\n");
+		return;
+	}
+	std::map<std::string, string_resource_struct>::const_iterator it;
+	gui_print("Dumping all strings:\n");
+	for (it = mStrings.begin(); it != mStrings.end(); it++)
+		gui_print("source: %s: '%s' = '%s'\n", it->second.source.c_str(), it->first.c_str(), it->second.value.c_str());
+	gui_print("Done dumping strings\n");
 }
 
 ResourceManager::ResourceManager()
 {
 }
 
-void ResourceManager::LoadResources(xml_node<>* resList, ZipArchive* pZip)
+void ResourceManager::AddStringResource(std::string resource_source, std::string resource_name, std::string value)
+{
+	string_resource_struct res;
+	res.source = resource_source;
+	res.value = value;
+	mStrings[resource_name] = res;
+}
+
+void ResourceManager::LoadResources(xml_node<>* resList, ZipWrap* pZip, std::string resource_source)
 {
 	if (!resList)
 		return;
@@ -315,6 +370,26 @@ void ResourceManager::LoadResources(xml_node<>* resList, ZipArchive* pZip)
 				delete res;
 			}
 		}
+		else if (type == "fontoverride")
+		{
+			if (mFonts.size() != 0 && child && child->first_attribute("name")) {
+				string FontName = child->first_attribute("name")->value();
+				size_t font_count = mFonts.size(), i;
+				bool found = false;
+
+				for (i = 0; i < font_count; i++) {
+					if (mFonts[i]->GetName() == FontName) {
+						mFonts[i]->Override(child, pZip);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					LOGERR("Unable to locate font '%s' for override.\n", FontName.c_str());
+				}
+			} else if (mFonts.size() != 0)
+				LOGERR("Unable to locate font name for type fontoverride.\n");
+		}
 		else if (type == "image")
 		{
 			ImageResource* res = new ImageResource(child, pZip);
@@ -337,9 +412,12 @@ void ResourceManager::LoadResources(xml_node<>* resList, ZipArchive* pZip)
 		}
 		else if (type == "string")
 		{
-			if (xml_attribute<>* attr = child->first_attribute("name"))
-				mStrings[attr->value()] = child->value();
-			else
+			if (xml_attribute<>* attr = child->first_attribute("name")) {
+				string_resource_struct res;
+				res.source = resource_source;
+				res.value = child->value();
+				mStrings[attr->value()] = res;
+			} else
 				error = true;
 		}
 		else

@@ -23,15 +23,14 @@
 
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 }
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
 #include "../data.hpp"
 #include "../twrp-functions.hpp"
-
-#define TW_FILESELECTOR_UP_A_LEVEL "(Up A Level)"
+#include "../adbbu/libtwadbbu.hpp"
 
 int GUIFileSelector::mSortOrder = 0;
 
@@ -129,7 +128,7 @@ GUIFileSelector::~GUIFileSelector()
 
 int GUIFileSelector::Update(void)
 {
-	if(!isConditionTrue())
+	if (!isConditionTrue())
 		return 0;
 
 	GUIScrollList::Update();
@@ -157,7 +156,7 @@ int GUIFileSelector::NotifyVarChange(const std::string& varName, const std::stri
 {
 	GUIScrollList::NotifyVarChange(varName, value);
 
-	if(!isConditionTrue())
+	if (!isConditionTrue())
 		return 0;
 
 	if (varName.empty()) {
@@ -186,9 +185,9 @@ bool GUIFileSelector::fileSort(FileData d1, FileData d2)
 		return -1;
 	if (d2.fileName == ".")
 		return 0;
-	if (d1.fileName == TW_FILESELECTOR_UP_A_LEVEL)
+	if (d1.fileName == "..")
 		return -1;
-	if (d2.fileName == TW_FILESELECTOR_UP_A_LEVEL)
+	if (d2.fileName == "..")
 		return 0;
 
 	switch (mSortOrder) {
@@ -251,12 +250,8 @@ int GUIFileSelector::GetFileList(const std::string folder)
 			continue;
 		if (data.fileName == ".." && folder == "/")
 			continue;
-		if (data.fileName == "..") {
-			data.fileName = TW_FILESELECTOR_UP_A_LEVEL;
-			data.fileType = DT_DIR;
-		} else {
-			data.fileType = de->d_type;
-		}
+
+		data.fileType = de->d_type;
 
 		std::string path = folder + "/" + data.fileName;
 		stat(path.c_str(), &st);
@@ -272,11 +267,14 @@ int GUIFileSelector::GetFileList(const std::string folder)
 			data.fileType = TWFunc::Get_D_Type_From_Stat(path);
 		}
 		if (data.fileType == DT_DIR) {
-			if (mShowNavFolders || (data.fileName != "." && data.fileName != TW_FILESELECTOR_UP_A_LEVEL))
+			if (mShowNavFolders || (data.fileName != "." && data.fileName != ".."))
 				mFolderList.push_back(data);
 		} else if (data.fileType == DT_REG || data.fileType == DT_LNK || data.fileType == DT_BLK) {
 			if (mExtn.empty() || (data.fileName.length() > mExtn.length() && data.fileName.substr(data.fileName.length() - mExtn.length()) == mExtn)) {
-				mFileList.push_back(data);
+				if (mExtn == ".ab" && twadbbu::Check_ADB_Backup_File(path))
+					mFolderList.push_back(data);
+				else
+					mFileList.push_back(data);
 			}
 		}
 	}
@@ -311,7 +309,6 @@ size_t GUIFileSelector::GetItemCount()
 void GUIFileSelector::RenderItem(size_t itemindex, int yPos, bool selected)
 {
 	size_t folderSize = mShowFolders ? mFolderList.size() : 0;
-	size_t fileSize = mShowFiles ? mFileList.size() : 0;
 
 	ImageResource* icon;
 	std::string text;
@@ -319,6 +316,8 @@ void GUIFileSelector::RenderItem(size_t itemindex, int yPos, bool selected)
 	if (itemindex < folderSize) {
 		text = mFolderList.at(itemindex).fileName;
 		icon = mFolderIcon;
+		if (text == "..")
+			text = gui_lookup("up_a_level", "(Up A Level)");
 	} else {
 		text = mFileList.at(itemindex - folderSize).fileName;
 		icon = mFileIcon;
@@ -345,7 +344,7 @@ void GUIFileSelector::NotifySelect(size_t item_selected)
 
 			// Ignore requests to do nothing
 			if (str == ".")	 return;
-			if (str == TW_FILESELECTOR_UP_A_LEVEL) {
+			if (str == "..") {
 				if (cwd != "/") {
 					size_t found;
 					found = cwd.find_last_of('/');
@@ -359,8 +358,8 @@ void GUIFileSelector::NotifySelect(size_t item_selected)
 				cwd += str;
 			}
 
-			if (mShowNavFolders == 0 && mShowFiles == 0) {
-				// nav folders and files are disabled, this is probably the restore list and we need to save chosen location to mVariable instead of mPathVar
+			if (mShowNavFolders == 0 && (mShowFiles == 0 || mExtn == ".ab")) {
+				// this is probably the restore list and we need to save chosen location to mVariable instead of mPathVar
 				DataManager::SetValue(mVariable, cwd);
 			} else {
 				// We are changing paths, so we need to set mPathVar

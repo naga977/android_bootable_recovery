@@ -9,10 +9,19 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/limits.h>
 
 #include "c.h"
 #include "fileutils.h"
 #include "pathnames.h"
+
+#ifndef _PATH_TMP
+#define _PATH_TMP   "/tmp/"
+#endif
+
+#ifndef OPEN_MAX
+#define OPEN_MAX 256
+#endif
 
 /* Create open temporary file in safe way.  Please notice that the
  * file permissions are -rw------- by default. */

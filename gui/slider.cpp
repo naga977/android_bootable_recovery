@@ -1,3 +1,21 @@
+/*
+	Copyright 2017 TeamWin
+	This file is part of TWRP/TeamWin Recovery Project.
+
+	TWRP is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	TWRP is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 // slider.cpp - GUISlider object
 // Pulled & ported from https://raw.github.com/agrabren/RecoverWin/master/gui/slider.cpp
 
@@ -21,8 +39,8 @@
 
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 }
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
@@ -80,6 +98,7 @@ GUISlider::GUISlider(xml_node<>* node) : GUIObject(node)
 		sSliderLabel->GetCurrentBounds(w, h);
 		int sTextY = mRenderY + ((mRenderH - h) / 2);
 		sSliderLabel->SetRenderPos(sTextX, sTextY);
+		sSliderLabel->SetMaxWidth(mRenderW);
 	}
 	if (sTouch && sTouch->GetResource())
 	{
@@ -107,7 +126,7 @@ GUISlider::~GUISlider()
 
 int GUISlider::Render(void)
 {
-	if(!isConditionTrue())
+	if (!isConditionTrue())
 		return 0;
 
 	if (!sSlider || !sSlider->GetResource())
@@ -135,7 +154,7 @@ int GUISlider::Render(void)
 
 int GUISlider::Update(void)
 {
-	if(!isConditionTrue())
+	if (!isConditionTrue())
 		return 0;
 
 	if (sUpdate)
@@ -145,7 +164,7 @@ int GUISlider::Update(void)
 
 int GUISlider::NotifyTouch(TOUCH_STATE state, int x, int y)
 {
-	if(!isConditionTrue())
+	if (!isConditionTrue())
 		return -1;
 
 	static bool dragging = false;

@@ -1,3 +1,21 @@
+/*
+	Copyright 2017 TeamWin
+	This file is part of TWRP/TeamWin Recovery Project.
+
+	TWRP is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	TWRP is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 // checkbox.cpp - GUICheckbox object
 
 #include <stdarg.h>
@@ -19,8 +37,8 @@
 
 extern "C" {
 #include "../twcommon.h"
-#include "../minuitwrp/minui.h"
 }
+#include "../minuitwrp/minui.h"
 
 #include "rapidxml.hpp"
 #include "objects.hpp"
@@ -139,14 +157,16 @@ int GUICheckbox::SetRenderPos(int x, int y, int w, int h)
 	mRenderH = mCheckH;
 
 	mTextX = mRenderX + mCheckW + 5;
-	mTextY = mRenderY + ((mCheckH / 2) - (textH / 2));
+	mTextY = mRenderY + (mCheckH / 2);
 
 	mLabel->SetRenderPos(mTextX, mTextY, 0, 0);
+	mLabel->SetPlacement(TEXT_ONLY_RIGHT);
+	mLabel->SetMaxWidth(gr_fb_width() - mTextX);
 	SetActionPos(mRenderX, mRenderY, mRenderW, mRenderH);
 	return 0;
 }
 
-int GUICheckbox::NotifyTouch(TOUCH_STATE state, int x, int y)
+int GUICheckbox::NotifyTouch(TOUCH_STATE state, int x __unused, int y __unused)
 {
 	if (!isConditionTrue())
 		return -1;

@@ -1,113 +1,158 @@
+TWRP_TOOLBOX_PATH := $(call my-dir)
 LOCAL_PATH := system/core/toolbox
 include $(CLEAR_VARS)
 
-OUR_TOOLS := \
-    start \
-    stop \
-    getprop \
-    setprop
+OUR_TOOLS :=
+
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 24; echo $$?),0)
+    OUR_TOOLS := \
+        start \
+        stop
+endif
+    
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
+    OUR_TOOLS += \
+        getprop \
+        setprop
+endif
 
 # If busybox does not have SELinux support, provide these tools with toolbox.
 # Note that RECOVERY_BUSYBOX_TOOLS will be empty if TW_USE_TOOLBOX == true.
-ifeq ($(TWHAVE_SELINUX), true)
-    TOOLS_FOR_SELINUX := \
-        ls \
+TOOLS_FOR_SELINUX := \
+    ls
+
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
+    TOOLS_FOR_SELINUX += \
+        load_policy \
         getenforce \
         chcon \
         restorecon \
         runcon \
         getsebool \
-        setsebool \
-        load_policy
-    OUR_TOOLS += $(filter-out $(RECOVERY_BUSYBOX_TOOLS), $(TOOLS_FOR_SELINUX))
+        setsebool
+endif
 
-    # toolbox setenforce is used during init, so it needs to be included here
-    # symlink is omitted at the very end if busybox already provides this
-    OUR_TOOLS += setenforce
+OUR_TOOLS += $(filter-out $(RECOVERY_BUSYBOX_TOOLS), $(TOOLS_FOR_SELINUX))
+
+# toolbox setenforce is used during init, so it needs to be included here
+# symlink is omitted at the very end if busybox already provides this
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
+   OUR_TOOLS += setenforce
 endif
 
 ifeq ($(TW_USE_TOOLBOX), true)
-    ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
-        OUR_TOOLS += \
-            mknod \
-            nohup
+    ifeq ($(shell test $(PLATFORM_SDK_VERSION) -gt 22; echo $$?),0)
+        # These are the only toolbox tools in M. The rest are now in toybox.
         BSD_TOOLS := \
-            cat \
-            chown \
-            cp \
-            dd \
-            du \
-            grep \
-            kill \
-            ln \
-            mv \
-            printenv \
-            rm \
-            rmdir \
-            sleep \
-            sync
-    else
-        OUR_TOOLS += \
-            cat \
-            chown \
-            dd \
-            du \
-            kill \
-            ln \
-            mv \
-            printenv \
-            rm \
-            rmdir \
-            setconsole \
-            sleep \
-            sync
-    endif
+            $(if $(filter $(PLATFORM_SDK_VERSION), 23 24), du)
 
-    OUR_TOOLS += \
-        chmod \
-        clear \
-        cmp \
-        date \
-        df \
-        dmesg \
-        getevent \
-        hd \
-        id \
-        ifconfig \
-        iftop \
-        insmod \
-        ioctl \
-        ionice \
-        log \
-        lsmod \
-        lsof \
-        md5 \
-        mkdir \
-        mkswap \
-        mount \
-        nandread \
-        netstat \
-        newfs_msdos \
-        notify \
-        ps \
-        readlink \
-        renice \
-        rmmod \
-        route \
-        schedtop \
-        sendevent \
-        smd \
-        swapoff \
-        swapon \
-        top \
-        touch \
-        umount \
-        uptime \
-        vmstat \
-        watchprops \
-        wipe
-    ifneq ($(TWHAVE_SELINUX), true)
-        OUR_TOOLS += ls
+        OUR_TOOLS := \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; iftop),) \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; ioctl),) \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; nandread),) \
+            newfs_msdos \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; prlimit),) \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; sendevent),) \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; start),) \
+            $(if $(shell test $(PLATFORM_SDK_VERSION) -lt 26; stop),) \
+
+        ifneq (,$(filter $(PLATFORM_SDK_VERSION), 23))
+            BSD_TOOLS += \
+                dd \
+
+            OUR_TOOLS += \
+                df \
+                ionice \
+                log \
+                ls \
+                lsof \
+                mount \
+                ps \
+                renice \
+                top \
+                uptime \
+                watchprops
+        endif
+    else
+        ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
+            OUR_TOOLS += \
+                mknod \
+                nohup
+            BSD_TOOLS := \
+                cat \
+                chown \
+                cp \
+                dd \
+                du \
+                grep \
+                kill \
+                ln \
+                mv \
+                printenv \
+                rm \
+                rmdir \
+                sleep \
+                sync
+        else
+            OUR_TOOLS += \
+                cat \
+                chown \
+                dd \
+                du \
+                kill \
+                ln \
+                mv \
+                printenv \
+                rm \
+                rmdir \
+                setconsole \
+                sleep \
+                sync
+        endif
+
+        OUR_TOOLS += \
+            chmod \
+            clear \
+            cmp \
+            date \
+            df \
+            dmesg \
+            getevent \
+            hd \
+            id \
+            ifconfig \
+            iftop \
+            insmod \
+            ioctl \
+            ionice \
+            log \
+            lsmod \
+            lsof \
+            md5 \
+            mkdir \
+            mkswap \
+            mount \
+            nandread \
+            netstat \
+            newfs_msdos \
+            notify \
+            ps \
+            readlink \
+            renice \
+            rmmod \
+            route \
+            schedtop \
+            sendevent \
+            smd \
+            swapoff \
+            swapon \
+            top \
+            touch \
+            umount \
+            uptime \
+            vmstat \
+            watchprops \
+            wipe
     endif
 endif
 
@@ -135,7 +180,7 @@ ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
         upstream-netbsd/lib/libutil/raise_default_signal.c
 endif
 
-ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
+ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22 23))
     LOCAL_CFLAGS += \
         -std=gnu99 \
         -Werror -Wno-unused-parameter \
@@ -161,15 +206,35 @@ else
         liblog
 endif
 
-ifeq ($(TWHAVE_SELINUX), true)
-    LOCAL_SHARED_LIBRARIES += libselinux
-endif
+LOCAL_SHARED_LIBRARIES += libselinux
 
-ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
+ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22 23))
     # libusbhost is only used by lsusb, and that isn't usually included in toolbox.
     # The linker strips out all the unused library code in the normal case.
     LOCAL_STATIC_LIBRARIES := libusbhost
     LOCAL_WHOLE_STATIC_LIBRARIES := $(patsubst %,libtoolbox_%,$(BSD_TOOLS))
+endif
+
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -gt 22; echo $$?),0)
+    # Rule to make getprop and setprop in M trees where toybox normally
+    # provides these tools. Toybox does not allow for easy dynamic
+    # configuration, so we would have to include the entire toybox binary
+    # which takes up more space than is necessary so long as we are still
+    # including busybox.
+ifneq ($(TW_USE_TOOLBOX), true)
+    LOCAL_SRC_FILES += \
+        ../../../$(TWRP_TOOLBOX_PATH)/getprop.c \
+        ../../../$(TWRP_TOOLBOX_PATH)/setprop.c \
+        ../../../$(TWRP_TOOLBOX_PATH)/ls.c
+    OUR_TOOLS += getprop setprop
+endif
+endif
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -gt 23; echo $$?),0)
+    # Rule for making start and stop in N trees
+    LOCAL_SRC_FILES += \
+        ../../../$(TWRP_TOOLBOX_PATH)/start.c \
+        ../../../$(TWRP_TOOLBOX_PATH)/stop.c
+    OUR_TOOLS += start stop
 endif
 
 LOCAL_MODULE := toolbox_recovery
@@ -182,7 +247,7 @@ include $(BUILD_EXECUTABLE)
 
 $(LOCAL_PATH)/toolbox.c: $(intermediates)/tools.h
 
-ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22))
+ifneq (,$(filter $(PLATFORM_SDK_VERSION), 21 22 23))
     ALL_TOOLS := $(BSD_TOOLS) $(OUR_TOOLS)
 else
     ALL_TOOLS := $(OUR_TOOLS)
@@ -195,13 +260,11 @@ $(TOOLS_H): $(LOCAL_PATH)/Android.mk
 $(TOOLS_H):
 	$(transform-generated-source)
 
-ifeq ($(TWHAVE_SELINUX), true)
-    # toolbox setenforce is used during init in non-symlink form, so it was
-    # required to be included as part of the suite above. if busybox already
-    # provides setenforce, we can omit the toolbox symlink
-    TEMP_TOOLS := $(filter-out $(RECOVERY_BUSYBOX_TOOLS), $(ALL_TOOLS))
-    ALL_TOOLS := $(TEMP_TOOLS)
-endif
+# toolbox setenforce is used during init in non-symlink form, so it was
+# required to be included as part of the suite above. if busybox already
+# provides setenforce, we can omit the toolbox symlink
+TEMP_TOOLS := $(filter-out $(RECOVERY_BUSYBOX_TOOLS), $(ALL_TOOLS))
+ALL_TOOLS := $(TEMP_TOOLS)
 
 # Make /sbin/toolbox launchers for each tool
 SYMLINKS := $(addprefix $(TARGET_RECOVERY_ROOT_OUT)/sbin/,$(ALL_TOOLS))

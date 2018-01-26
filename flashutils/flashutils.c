@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "flashutils/flashutils.h"
 
@@ -21,10 +22,12 @@ int device_flash_type()
     if (the_flash_type == UNKNOWN) {
         if (access(BOARD_BML_BOOT, F_OK) == 0) {
             the_flash_type = BML;
-        } else if (access("/proc/emmc", F_OK) == 0) {
-            the_flash_type = MMC;
         } else if (access("/proc/mtd", F_OK) == 0) {
             the_flash_type = MTD;
+        } else if (access("/proc/emmc", F_OK) == 0 ||
+                   access("/dev/block/mmcblk0", F_OK) == 0 ||
+                   access("/dev/block/sda", F_OK) == 0) {
+            the_flash_type = MMC;
         } else {
             the_flash_type = UNSUPPORTED;
         }
@@ -53,7 +56,7 @@ static int detect_partition(const char *partitionType, const char *partition)
     int type = device_flash_type();
     if (strstr(partition, "/dev/block/mtd") != NULL)
         type = MTD;
-    else if (strstr(partition, "/dev/block/mmc") != NULL)
+    else if (strstr(partition, "/dev/block/mmc") != NULL || strstr(partition, "/dev/block/sd") != NULL)
         type = MMC;
     else if (strstr(partition, "/dev/block/bml") != NULL)
         type = BML;
